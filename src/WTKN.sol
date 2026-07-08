@@ -46,6 +46,15 @@ contract WTKN is
     /// @notice Blacklist for regulatory compliance
     mapping(address => bool) public blacklisted;
 
+    /// @notice Staked amount per (ROR contract, ROR token id).
+    /// @dev ROR token ids are NOT globally unique — every ROR contract restarts
+    /// its counter at MIN_TOKEN_ID (1000) — and one WTKN is shared across many
+    /// ROR contracts. Keying stakes by token id alone made the 2nd+ ROR contract
+    /// collide on the same id. Staking is therefore keyed by the calling ROR
+    /// contract. `stakedPerToken` above is retained (never reordered) to preserve
+    /// UUPS storage layout and to service legacy stakes recorded before this fix.
+    mapping(address => mapping(uint256 => uint256)) public stakedPerRorToken;
+
     // Events
     event RORContractSet(address indexed rorContract); // Legacy event
     event RORContractAdded(address indexed rorContract);
@@ -203,10 +212,13 @@ contract WTKN is
     function recordStake(uint256 rorTokenId, uint256 amount) external {
         if (!authorizedRORContracts[msg.sender]) revert OnlyRORContract();
         if (amount == 0) revert InvalidAmount();
-        if (stakedPerToken[rorTokenId] > 0) revert InvalidAmount(); // Prevent double staking
-        
+        // Key by (ROR contract, token id). Token ids collide across ROR contracts
+        // sharing this WTKN, so a token-id-only guard wrongly blocked every mint
+        // after the first for a given buyer.
+        if (stakedPerRorToken[msg.sender][rorTokenId] > 0) revert InvalidAmount(); // Prevent double staking
+
         totalStaked += amount;
-        stakedPerToken[rorTokenId] = amount;
+        stakedPerRorToken[msg.sender][rorTokenId] = amount;
         emit WTKNStaked(rorTokenId, amount);
     }
 
@@ -219,10 +231,18 @@ contract WTKN is
         if (!authorizedRORContracts[msg.sender]) revert OnlyRORContract();
         if (amount == 0) revert InvalidAmount();
         if (amount > totalStaked) revert InvalidUnstakeAmount();
-        if (amount > stakedPerToken[rorTokenId]) revert InvalidUnstakeAmount();
+
+        uint256 perRor = stakedPerRorToken[msg.sender][rorTokenId];
+        if (perRor >= amount) {
+            stakedPerRorToken[msg.sender][rorTokenId] = perRor - amount;
+        } else if (stakedPerToken[rorTokenId] >= amount) {
+            // Legacy stake recorded before per-ROR keying — unstake from old map.
+            stakedPerToken[rorTokenId] -= amount;
+        } else {
+            revert InvalidUnstakeAmount();
+        }
 
         totalStaked -= amount;
-        stakedPerToken[rorTokenId] -= amount;
         emit WTKNUnstaked(rorTokenId, amount);
     }
 
@@ -241,7 +261,12 @@ contract WTKN is
      * @return Staked amount
      */
     function getStakedAmount(uint256 rorTokenId) external view returns (uint256) {
-        return stakedPerToken[rorTokenId];
+        return stakedPerToken[rorTokenId]; // legacy global view (pre-fix stakes)
+    }
+
+    /// @notice Staked amount for a specific ROR contract's token (post-fix keying).
+    function getStakedAmountForRor(address ror, uint256 rorTokenId) external view returns (uint256) {
+        return stakedPerRorToken[ror][rorTokenId];
     }
 
     /**
