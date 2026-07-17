@@ -119,6 +119,13 @@ interface IROR_ERC1155 {
         uint256 amount
     );
 
+    event WTKNReleaseRedirected(
+        uint256 indexed tokenId,
+        address indexed holder,
+        address indexed newRecipient,
+        uint256 amount
+    );
+
     event WTKNContractRegistered(
         address indexed buyer,
         address indexed wtknContract
@@ -164,6 +171,7 @@ interface IROR_ERC1155 {
     error SupplierIsBuyer();
     error TokenDoesNotExist();
     error NoPendingRelease(uint256 tokenId, address holder);
+    error WTKNTransferFailed();
     error MustReleaseBefore();
     error InvalidStatusChange();
     error AllWTKNNotReleased();

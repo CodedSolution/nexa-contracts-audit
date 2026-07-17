@@ -351,6 +351,52 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         }
     }
 
+    /**
+     * @notice Admin escape hatch for a parked WTKN release that can never reach
+     *         the original holder (e.g. the holder is permanently blacklisted on
+     *         the WTKN contract). Pays the parked amount to an alternate
+     *         recipient (e.g. treasury/escrow), clears the pending balance, and
+     *         finalizes settlement so recordUnstake can run.
+     * @dev    The transfer to newRecipient must succeed; if it reverts (e.g.
+     *         newRecipient is also blacklisted) or returns false, the entire
+     *         call reverts and no state is changed — pick a receivable address.
+     * @param tokenId       The RoR token id.
+     * @param holder        The original (stuck) holder whose release is parked.
+     * @param newRecipient  Alternate address to receive the parked WTKN.
+     */
+    function redirectPendingRelease(
+        uint256 tokenId,
+        address holder,
+        address newRecipient
+    ) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (newRecipient == address(0)) revert IROR_ERC1155.InvalidAddress();
+
+        uint256 pending = _pendingWTKNRelease[tokenId][holder];
+        if (pending == 0) revert IROR_ERC1155.NoPendingRelease(tokenId, holder);
+
+        WTKNStake storage stake = wtknStakes[tokenId];
+
+        // Effects before interaction. If the transfer below reverts, all of
+        // these state changes roll back with it.
+        _pendingWTKNRelease[tokenId][holder] = 0;
+        _hasClaimed[tokenId][holder] = true;
+        stake.totalReleased += pending;
+
+        // Interaction — must succeed, otherwise revert the whole call.
+        if (!IWTKN(stake.wtknContract).transfer(newRecipient, pending)) {
+            revert IROR_ERC1155.WTKNTransferFailed();
+        }
+
+        emit IROR_ERC1155.WTKNReleaseRedirected(tokenId, holder, newRecipient, pending);
+        emit IROR_ERC1155.WTKNReleased(tokenId, newRecipient, pending);
+
+        // Finalize settlement if this was the last outstanding release.
+        if (stake.totalReleased >= stake.amount && !stake.isReleased) {
+            stake.isReleased = true;
+            IWTKN(stake.wtknContract).recordUnstake(tokenId, stake.amount);
+        }
+    }
+
     // ============ Burn Functions ============
 
     function burnRORBatch(uint256[] calldata tokenIds) external nonReentrant {
@@ -363,11 +409,39 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
             if (balance == 0) continue;
 
             WTKNStake storage stake = wtknStakes[tokenId];
-            if (stake.maturityReached && stake.releasedAmounts[msg.sender] == 0) continue;
+
+            // (A) Once the invoice due date has passed, the holder set is frozen
+            // for settlement — mirror the transfer maturity gate and block
+            // write-offs (burns) until this holder's WTKN has actually been
+            // released. A burn in the post-due-date, pre-release window would
+            // otherwise redistribute the buyer's collateral to the remaining
+            // holders, or strand it entirely if it empties the supply.
+            bool matured =
+                (stake.expiryDate > 0 && block.timestamp >= stake.expiryDate) ||
+                stake.maturityReached;
+            if (matured && stake.releasedAmounts[msg.sender] == 0) continue;
 
             _burn(msg.sender, tokenId, balance);
 
             if (totalSupply(tokenId) == 0) {
+                // (B) If the final receivable is written off while staked
+                // collateral is still unreleased (only reachable before the due
+                // date now that (A) blocks the post-due-date window), return the
+                // unreleased WTKN to the anchor buyer instead of sealing it in
+                // this contract forever.
+                if (stake.amount > 0 && !stake.isReleased) {
+                    uint256 remaining = stake.amount - stake.totalReleased;
+                    if (remaining > 0) {
+                        IWTKN wtkn = IWTKN(stake.wtknContract);
+                        address buyer = wtkn.anchorBuyer();
+                        stake.totalReleased = stake.amount;
+                        stake.isReleased = true;
+                        wtkn.recordUnstake(tokenId, remaining);
+                        if (!wtkn.transfer(buyer, remaining)) {
+                            revert IROR_ERC1155.WTKNTransferFailed();
+                        }
+                    }
+                }
                 _updateStatus(tokenId, IROR_ERC1155.RoRStatus.SETTLED);
                 tokenState[tokenId].isSettled = true;
             }
@@ -439,22 +513,49 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
     ) internal virtual override {
         super._beforeTokenTransfer(operator, from, to, ids, amounts, data);
 
+        // Block transfers after maturity. This must run before balances change so
+        // it reverts the whole transfer. Holder-set tracking is intentionally NOT
+        // done here — it is handled in _afterTokenTransfer against final balances,
+        // which stays correct for self-transfers (from == to) and batches with
+        // duplicate token ids.
         for (uint256 i = 0; i < ids.length; i++) {
-            // Block transfers after maturity
             if (from != address(0) && to != address(0)) {
                 WTKNStake storage stake = wtknStakes[ids[i]];
                 if (stake.expiryDate > 0 && block.timestamp >= stake.expiryDate) {
                     revert IROR_ERC1155.TransferAfterMaturity();
                 }
             }
-            // Track new holder
-            if (to != address(0) && amounts[i] > 0) {
+        }
+    }
+
+    /**
+     * @dev Maintains the holder-tracking side-state (_holders / _isHolder /
+     *      _holderIndexPlusOne) from each address's FINAL balance, after OZ has
+     *      applied all balance updates. Deciding add/remove from the settled
+     *      balance is correct for every transfer shape: full-balance
+     *      self-transfers (from == to) keep the holder tracked because their
+     *      final balance is still positive, and batches with duplicate token ids
+     *      correctly remove the sender once the repeated entries deplete the
+     *      balance to zero. _addHolder/_removeHolder are idempotent (guarded by
+     *      _isHolder), so repeated ids in one batch are safe.
+     */
+    function _afterTokenTransfer(
+        address operator,
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal virtual override {
+        super._afterTokenTransfer(operator, from, to, ids, amounts, data);
+
+        for (uint256 i = 0; i < ids.length; i++) {
+            // Add recipient if they now hold a positive balance.
+            if (to != address(0) && balanceOf(to, ids[i]) > 0) {
                 _addHolder(ids[i], to);
             }
-            // Remove sender when they give away their entire balance (transfer or burn).
-            // Checked before the balance changes, so balanceOf == amounts[i] means
-            // the sender's balance will hit zero after this transfer.
-            if (from != address(0) && amounts[i] > 0 && balanceOf(from, ids[i]) == amounts[i]) {
+            // Remove sender only if their balance is now fully depleted.
+            if (from != address(0) && balanceOf(from, ids[i]) == 0) {
                 _removeHolder(ids[i], from);
             }
         }

@@ -302,7 +302,7 @@ contract WTKN is
      * @dev Exception: Authorized ROR contracts can transfer to anyone (for proportional release to holders)
      */
     function transfer(address to, uint256 amount) public override returns (bool) {
-        // Check blacklist for sender and recipient (consistent with transferFrom)
+        // Check blacklist for the initiator (also the sender here) and recipient.
         if (blacklisted[msg.sender]) revert AddressBlacklisted();
         if (blacklisted[to]) revert AddressBlacklisted();
         
@@ -323,7 +323,10 @@ contract WTKN is
      * @dev WTKN can only be transferred to anchorBuyer (return collateral) or authorized ROR contracts (staking)
      */
     function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
-        // Check blacklist
+        // Check blacklist for the initiator (spender), the source, and recipient.
+        // The spender check mirrors transfer() so a blacklisted address cannot
+        // move WTKN even via a previously granted allowance (full compliance freeze).
+        if (blacklisted[msg.sender]) revert AddressBlacklisted();
         if (blacklisted[from]) revert AddressBlacklisted();
         if (blacklisted[to]) revert AddressBlacklisted();
         

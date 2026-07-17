@@ -56,6 +56,7 @@ contract SubPool is
     }
 
     struct FinancingRecord {
+        // Original fields — order preserved for storage compatibility.
         address rorContract;     // ROR ERC1155 contract address
         uint256 rorTokenId;      // Token ID within the ROR contract
         uint256 wlpDeployed;     // Discounted amount sent to supplier
@@ -63,6 +64,12 @@ contract SubPool is
         uint256 financedAt;      // Block timestamp
         bool settled;            // Whether settlement has been received
         bool defaulted;          // Whether this financing has defaulted
+        // Appended fields — added at the END so existing records read cleanly.
+        uint256 financingId;     // Pool-assigned id (unique per financing on a token)
+        uint256 platformFeeOwed; // Platform fee earmarked at financing (not unit-backing)
+        uint256 reserveFeeOwed;  // Reserve fund fee earmarked at financing (not unit-backing)
+        bool platformFeeCollected; // Whether the platform fee has been swept out
+        bool reserveFeeCollected;  // Whether the reserve fund fee has been swept out
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -83,7 +90,7 @@ contract SubPool is
     uint256 public navTimestamp;     // When NAV was last updated
 
     // ─── Pool Accounting ───
-    uint256 public totalWlpBalance;              // WLP held by contract (available capital)
+    uint256 public totalWlpBalance;              // WLP held by contract (available capital, excludes earmarked fees)
     uint256 public totalFinancedOutstanding;     // WLP deployed to financings (not yet settled)
     uint256 public totalPlatformFeesCollected;
 
@@ -115,9 +122,22 @@ contract SubPool is
     mapping(address => bool) public isWhitelisted;
     bool public whitelistEnabled;
 
+    // ─── Fee / Reserve & per-financing accounting ───
+    // Appended after all prior state (and consuming from __gap) to preserve the
+    // UUPS proxy storage layout on upgrade. Do NOT reorder or insert above this.
+    address public reserveFundWallet;            // Destination for reserve fund fees
+    uint256 public totalReserveFundCollected;    // Cumulative reserve fund fees swept out
+    // Active (unsettled, non-defaulted) financingIds per token key — enables
+    // settling/defaulting all of a token's financings at once without a param.
+    mapping(bytes32 => uint256[]) internal tokenActiveFinancings;
+    // Monotonic financingId counter per token key. The pool assigns the id so a
+    // token can be financed repeatedly without collisions or an external source.
+    mapping(bytes32 => uint256) public nextFinancingId;
+
     // ─── Storage Gap ───
-    // Reserve trailing slots for future upgrades (leaf contract had none).
-    uint256[50] private __gap;
+    // Reduced from 50 → 46 to account for the 4 slots consumed above, keeping
+    // the total reserved storage footprint constant across this upgrade.
+    uint256[46] private __gap;
 
     // ═══════════════════════════════════════════════════════════════
     //                           EVENTS
@@ -144,6 +164,7 @@ contract SubPool is
         address indexed supplier,
         address indexed rorContract,
         uint256 indexed tokenId,
+        uint256 financingId,
         uint256 wlpAmount,
         uint256 faceValue
     );
@@ -157,7 +178,9 @@ contract SubPool is
         uint256 indexed tokenId,
         uint256 lossAmount
     );
-    event PlatformFeeCollected(uint256 amount, address feeWallet);
+    event PlatformFeeCollected(address indexed rorContract, uint256 indexed tokenId, uint256 indexed financingId, uint256 amount, address feeWallet);
+    event ReserveFundCollected(address indexed rorContract, uint256 indexed tokenId, uint256 indexed financingId, uint256 amount, address reserveFundWallet);
+    event ReserveFundWalletUpdated(address oldWallet, address newWallet);
     event InterestReceived(uint256 wlpAmount);
     event MaxPoolSizeUpdated(uint256 oldSize, uint256 newSize);
     event LockUpDurationUpdated(uint256 oldDuration, uint256 newDuration);
@@ -191,6 +214,7 @@ contract SubPool is
     error FinancingNotFound(bytes32 key);
     error FinancingAlreadySettled(bytes32 key);
     error FinancingAlreadyDefaulted(bytes32 key);
+    error FeesAlreadyCollected(bytes32 key);
     error BelowMinimumAllocation(uint256 amount, uint256 minimum);
     error SeriesNotFound(uint256 seriesId);
     error SeriesNotActive(uint256 seriesId);
@@ -233,6 +257,7 @@ contract SubPool is
         string memory _unitSymbol,
         address _wlpToken,
         address _feeWallet,
+        address _reserveFundWallet,
         address _owner,
         uint256 _maxPoolSize,
         uint256 _lockUpDuration,
@@ -242,6 +267,8 @@ contract SubPool is
     ) public initializer {
         if (_wlpToken == address(0)) revert InvalidAddress();
         if (_feeWallet == address(0)) revert InvalidAddress();
+        if (_reserveFundWallet == address(0)) revert InvalidAddress();
+        if (_reserveFundWallet == _feeWallet) revert InvalidAddress();
         if (_owner == address(0)) revert InvalidAddress();
         if (_maxPoolSize == 0) revert InvalidAmount();
         if (_maxUtilisationBps == 0 || _maxUtilisationBps > 10000) revert InvalidBps();
@@ -257,6 +284,7 @@ contract SubPool is
         unitSymbol = _unitSymbol;
         wlpToken = IERC20(_wlpToken);
         feeWallet = _feeWallet;
+        reserveFundWallet = _reserveFundWallet;
         lockUpDuration = _lockUpDuration;
         maxUtilisationBps = _maxUtilisationBps;
         earlyExitPenaltyBps = _earlyExitPenaltyBps;
@@ -419,21 +447,30 @@ contract SubPool is
      * @param tokenId ROR token ID
      * @param wlpAmount Discounted WLP amount to send to supplier
      * @param faceValue Full face value expected at maturity
+     * @param platformFee Platform fee earmarked from the discount (swept via collectPlatformFee)
+     * @param reserveFee Reserve fund fee earmarked from the discount (swept via collectReserveFund)
+     * @return financingId Pool-assigned id, unique per token; carried in SupplierFinanced
      */
     function financeSupplier(
         address supplier,
         address rorContract,
         uint256 tokenId,
         uint256 wlpAmount,
-        uint256 faceValue
-    ) external onlyOwner whenNotPaused nonReentrant {
+        uint256 faceValue,
+        uint256 platformFee,
+        uint256 reserveFee
+    ) external onlyOwner whenNotPaused nonReentrant returns (uint256 financingId) {
         if (supplier == address(0)) revert InvalidAddress();
         if (rorContract == address(0)) revert InvalidAddress();
         if (wlpAmount == 0 || faceValue == 0) revert InvalidAmount();
         if (faceValue < wlpAmount) revert InvalidAmount();
 
-        bytes32 key = _financingKey(rorContract, tokenId);
-        if (financings[key].financedAt != 0) revert FinancingAlreadyExists(key);
+        // The pool assigns its own financingId per token (like ROR nextFinancingId),
+        // so a token can be financed repeatedly with no key collision and no
+        // dependency on any externally-sourced id.
+        bytes32 tKey = _tokenKey(rorContract, tokenId);
+        financingId = ++nextFinancingId[tKey];
+        bytes32 key = _financingKey(rorContract, tokenId, financingId);
 
         // Check utilisation cap
         uint256 poolValue = totalWlpBalance + totalFinancedOutstanding;
@@ -445,27 +482,40 @@ contract SubPool is
             }
         }
 
+        // The discount retained in the pool must cover both the fees we earmark
+        // and still leave the amount sent to the supplier backed by real capital.
+        uint256 totalCommit = wlpAmount + platformFee + reserveFee;
+
         // Verify tracked balance matches actual contract balance to detect drift.
         // Use the lesser of the two as the available liquidity so we never
         // over-commit capital that the contract doesn't actually hold.
         uint256 actualBalance = wlpToken.balanceOf(address(this));
         uint256 available = totalWlpBalance < actualBalance ? totalWlpBalance : actualBalance;
-        if (available < wlpAmount) revert InsufficientLiquidity(available, wlpAmount);
+        if (available < totalCommit) revert InsufficientLiquidity(available, totalCommit);
 
         // CEI: update all state before the external transfer call.
-        totalWlpBalance -= wlpAmount;
+        // Fees are moved OUT of unit-backing capital and held as per-financing
+        // liabilities, so they can never be counted as NAV backing or drained
+        // as investor principal by fee collection.
+        totalWlpBalance -= totalCommit;
         totalFinancedOutstanding += faceValue;
         financings[key] = FinancingRecord({
             rorContract: rorContract,
             rorTokenId: tokenId,
+            financingId: financingId,
             wlpDeployed: wlpAmount,
             faceValue: faceValue,
             financedAt: block.timestamp,
+            platformFeeOwed: platformFee,
+            reserveFeeOwed: reserveFee,
             settled: false,
-            defaulted: false
+            defaulted: false,
+            platformFeeCollected: false,
+            reserveFeeCollected: false
         });
+        tokenActiveFinancings[tKey].push(financingId);
 
-        emit SupplierFinanced(supplier, rorContract, tokenId, wlpAmount, faceValue);
+        emit SupplierFinanced(supplier, rorContract, tokenId, financingId, wlpAmount, faceValue);
 
         // External call last (Checks-Effects-Interactions).
         // safeTransfer reverts on failure, rolling back all state changes above.
@@ -486,17 +536,23 @@ contract SubPool is
     ) external onlyOwner whenNotPaused {
         if (wlpAmount == 0) revert InvalidAmount();
 
-        bytes32 key = _financingKey(rorContract, tokenId);
-        FinancingRecord storage financing = financings[key];
-        if (financing.financedAt == 0) revert FinancingNotFound(key);
-        if (financing.settled) revert FinancingAlreadySettled(key);
-        if (financing.defaulted) revert FinancingAlreadyDefaulted(key);
+        // The buyer settles the whole token at once. Settle every currently
+        // active financing on it in one call — no per-financing id required.
+        bytes32 tKey = _tokenKey(rorContract, tokenId);
+        uint256[] storage ids = tokenActiveFinancings[tKey];
+        if (ids.length == 0) revert FinancingNotFound(tKey);
 
-        // Mark as settled
-        financing.settled = true;
+        uint256 totalFace;
+        for (uint256 i = 0; i < ids.length; i++) {
+            FinancingRecord storage f = financings[_financingKey(rorContract, tokenId, ids[i])];
+            f.settled = true;
+            totalFace += f.faceValue;
+        }
+        delete tokenActiveFinancings[tKey];
 
-        // Update accounting: reduce outstanding by face value, increase balance by received amount
-        totalFinancedOutstanding -= financing.faceValue;
+        // Update accounting: reduce outstanding by the summed face value,
+        // increase balance by the received amount (amount is trusted, as before).
+        totalFinancedOutstanding -= totalFace;
         totalWlpBalance += wlpAmount;
 
         emit SettlementReceived(rorContract, tokenId, wlpAmount);
@@ -529,41 +585,101 @@ contract SubPool is
     ) external onlyOwner {
         if (lossAmount == 0) revert InvalidAmount();
 
-        bytes32 key = _financingKey(rorContract, tokenId);
-        FinancingRecord storage financing = financings[key];
-        if (financing.financedAt == 0) revert FinancingNotFound(key);
-        if (financing.settled) revert FinancingAlreadySettled(key);
-        if (financing.defaulted) revert FinancingAlreadyDefaulted(key);
+        // Default writes off the whole token at once — mark every active
+        // financing on it as defaulted so a later settlement can't re-process them.
+        bytes32 tKey = _tokenKey(rorContract, tokenId);
+        uint256[] storage ids = tokenActiveFinancings[tKey];
+        if (ids.length == 0) revert FinancingNotFound(tKey);
 
-        // Mark as defaulted
-        financing.defaulted = true;
-
-        // Reduce outstanding (loss absorbed by NAV drop on next update)
-        if (lossAmount > totalFinancedOutstanding) {
-            totalFinancedOutstanding = 0;
-        } else {
-            totalFinancedOutstanding -= lossAmount;
+        uint256 totalFace;
+        for (uint256 i = 0; i < ids.length; i++) {
+            FinancingRecord storage f = financings[_financingKey(rorContract, tokenId, ids[i])];
+            f.defaulted = true;
+            totalFace += f.faceValue;
         }
+        delete tokenActiveFinancings[tKey];
+
+        // Reduce outstanding by the summed face value of the defaulted financings
+        // (mirrors receiveSettlement) so totalFinancedOutstanding stays an exact
+        // gross face-value accumulator: no residual stranding when the recovered
+        // loss differs from face value, no consumption of other tokens'
+        // outstanding, and no later settlement underflow. lossAmount is reported
+        // in the event as the economic loss but does not drive accounting — the
+        // loss flows through NAV on the next update.
+        totalFinancedOutstanding -= totalFace;
 
         emit DefaultRecorded(rorContract, tokenId, lossAmount);
     }
 
     /**
-     * @notice Collect platform fee — transfer WLP to fee wallet
-     * @param amount WLP amount to collect as platform fee
+     * @notice Collect the platform fee accrued by a specific financing.
+     * @dev The amount is fixed on-chain at financing time (platformFeeOwed) and
+     *      was already excluded from unit-backing capital, so this can never
+     *      touch investor principal. Idempotent per financing.
+     * @param rorContract ROR ERC1155 contract address
+     * @param tokenId ROR token ID
+     * @param financingId ROR financingId identifying the financing
      */
-    function collectPlatformFee(uint256 amount) external onlyOwner whenNotPaused {
-        if (amount == 0) revert InvalidAmount();
-        if (totalWlpBalance < amount) {
-            revert InsufficientLiquidity(totalWlpBalance, amount);
-        }
+    function collectPlatformFee(
+        address rorContract,
+        uint256 tokenId,
+        uint256 financingId
+    ) external onlyOwner whenNotPaused {
+        bytes32 key = _financingKey(rorContract, tokenId, financingId);
+        FinancingRecord storage f = financings[key];
+        if (f.financedAt == 0) revert FinancingNotFound(key);
+        if (f.platformFeeCollected) revert FeesAlreadyCollected(key);
 
-        totalWlpBalance -= amount;
+        uint256 amount = f.platformFeeOwed;
+        f.platformFeeCollected = true;
         totalPlatformFeesCollected += amount;
 
-        wlpToken.safeTransfer(feeWallet, amount);
+        if (amount > 0) {
+            wlpToken.safeTransfer(feeWallet, amount);
+        }
 
-        emit PlatformFeeCollected(amount, feeWallet);
+        emit PlatformFeeCollected(rorContract, tokenId, financingId, amount, feeWallet);
+    }
+
+    /**
+     * @notice Collect the reserve fund fee accrued by a specific financing.
+     * @dev Mirror of collectPlatformFee, routed to reserveFundWallet. Replaces
+     *      the old fee-wallet-swap workaround. Idempotent per financing.
+     * @param rorContract ROR ERC1155 contract address
+     * @param tokenId ROR token ID
+     * @param financingId ROR financingId identifying the financing
+     */
+    function collectReserveFund(
+        address rorContract,
+        uint256 tokenId,
+        uint256 financingId
+    ) external onlyOwner whenNotPaused {
+        bytes32 key = _financingKey(rorContract, tokenId, financingId);
+        FinancingRecord storage f = financings[key];
+        if (f.financedAt == 0) revert FinancingNotFound(key);
+        if (f.reserveFeeCollected) revert FeesAlreadyCollected(key);
+
+        uint256 amount = f.reserveFeeOwed;
+        f.reserveFeeCollected = true;
+        totalReserveFundCollected += amount;
+
+        if (amount > 0) {
+            wlpToken.safeTransfer(reserveFundWallet, amount);
+        }
+
+        emit ReserveFundCollected(rorContract, tokenId, financingId, amount, reserveFundWallet);
+    }
+
+    /**
+     * @notice Update the reserve fund wallet (owner only).
+     * @param newWallet New reserve fund wallet address
+     */
+    function setReserveFundWallet(address newWallet) external onlyOwner {
+        if (newWallet == address(0)) revert InvalidAddress();
+        if (newWallet == feeWallet) revert InvalidAddress();
+        address oldWallet = reserveFundWallet;
+        reserveFundWallet = newWallet;
+        emit ReserveFundWalletUpdated(oldWallet, newWallet);
     }
 
     /**
@@ -753,14 +869,20 @@ contract SubPool is
     ) external onlyOwner {
         Series storage s = seriesRegistry[seriesId];
         if (s.lockUpSeconds == 0) revert SeriesNotFound(seriesId);
-        if (endDate > 0 && endDate <= startDate) revert InvalidSeriesConfig();
 
-        s.startDate = startDate;
+        // startDate == 0 is the documented "keep existing" sentinel. Honor it so
+        // routine updates to other fields don't overwrite startDate with the Unix
+        // epoch, which allocate() would treat as immediately open and could reopen
+        // a future-dated series before its intended launch.
+        uint256 newStartDate = startDate == 0 ? s.startDate : startDate;
+        if (endDate > 0 && endDate <= newStartDate) revert InvalidSeriesConfig();
+
+        s.startDate = newStartDate;
         s.endDate = endDate;
         s.maxSize = maxSize;
         s.minAllocation = minAllocation;
 
-        emit SeriesUpdated(seriesId, startDate, endDate, maxSize, minAllocation);
+        emit SeriesUpdated(seriesId, newStartDate, endDate, maxSize, minAllocation);
     }
 
     /**
@@ -853,8 +975,12 @@ contract SubPool is
     /**
      * @notice Get a financing record by its key
      */
-    function getFinancingKey(address rorContract, uint256 tokenId) external pure returns (bytes32) {
-        return _financingKey(rorContract, tokenId);
+    function getFinancingKey(address rorContract, uint256 tokenId, uint256 financingId)
+        external
+        pure
+        returns (bytes32)
+    {
+        return _financingKey(rorContract, tokenId, financingId);
     }
 
     /**
@@ -869,7 +995,7 @@ contract SubPool is
      * @notice Get implementation version
      */
     function version() public pure virtual returns (string memory) {
-        return "1.3.0";
+        return "1.4.0";
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -916,16 +1042,29 @@ contract SubPool is
 
         // Transfer WLP to investor
         totalWlpBalance -= wlpToReturn;
+
         wlpToken.safeTransfer(investor, wlpToReturn);
 
         emit Redeemed(investor, units, wlpToReturn, allocationIndex, early);
     }
 
     /**
-     * @dev Generate a unique key for a financing record
+     * @dev Generate a unique key for a financing record. Includes financingId so
+     *      a single token can be financed repeatedly without key collisions.
      */
-    function _financingKey(address rorContract, uint256 tokenId) internal pure returns (bytes32) {
-        return keccak256(abi.encodePacked(rorContract, tokenId));
+    function _financingKey(address rorContract, uint256 tokenId, uint256 financingId)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(rorContract, tokenId, financingId));
+    }
+
+    /**
+     * @dev Token-scoped key used to index all financings on a given token.
+     */
+    function _tokenKey(address rorContract, uint256 tokenId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(rorContract, tokenId));
     }
 
     /**
