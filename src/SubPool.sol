@@ -195,6 +195,10 @@ contract SubPool is
     event SeriesDeactivated(uint256 indexed seriesId);
     event WhitelistUpdated(address indexed investor, bool status);
     event WhitelistToggled(bool enabled);
+    // Recovery / migration
+    event FinancingReindexed(address indexed rorContract, uint256 indexed tokenId, uint256 financingId, uint256 faceValue);
+    event OutstandingReconciled(uint256 oldValue, uint256 newValue);
+    event Migrated(uint64 version);
 
     // ═══════════════════════════════════════════════════════════════
     //                           ERRORS
@@ -905,6 +909,101 @@ contract SubPool is
     }
 
     // ═══════════════════════════════════════════════════════════════
+    //                 MIGRATION / RECOVERY  (owner only)
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * @notice One-time migration entrypoint, run atomically during an upgrade via
+     *         upgradeToAndCall(newImpl, abi.encodeCall(SubPool.migrateV2, ())).
+     * @dev This implementation adds recovery functions only (no new storage), so the
+     *      body is just a version marker. The PATTERN is the point: every future
+     *      upgrade that changes storage or an on-chain index MUST perform its backfill
+     *      here and be invoked with this calldata — never upgradeToAndCall(impl, "").
+     *      onlyOwner + reinitializer(2) => runs exactly once, only by the owner.
+     */
+    function migrateV2() external onlyOwner reinitializer(2) {
+        emit Migrated(2);
+    }
+
+    /**
+     * @notice Rebuild the on-chain tracking for a financing that exists off-chain
+     *         (real WLP was deployed) but is missing from this implementation's
+     *         index — e.g. a financing created by a prior implementation before an
+     *         upgrade introduced tokenActiveFinancings/nextFinancingId and was never
+     *         backfilled, so receiveSettlement reverts FinancingNotFound. Restores
+     *         financings[key], tokenActiveFinancings and nextFinancingId so a normal
+     *         receiveSettlement / recordDefault can close it.
+     * @dev Values MUST come from the trusted off-chain record of the original
+     *      financing (the same numbers passed to the original financeSupplier). This
+     *      moves NO WLP. Idempotent: reverts if a record already exists for the key.
+     * @param addToOutstanding Whether to add faceValue to totalFinancedOutstanding.
+     *      Pass FALSE when the prior implementation already counted it in the
+     *      (storage-preserved) totalFinancedOutstanding — the normal post-upgrade
+     *      case, where receiveSettlement's `-= faceValue` must balance. Pass TRUE
+     *      only if the outstanding accumulator does not already include it. If in
+     *      doubt, reindex FALSE and set the accumulator via adminReconcileOutstanding.
+     */
+    function adminReindexFinancing(
+        address rorContract,
+        uint256 tokenId,
+        uint256 financingId,
+        uint256 wlpDeployed,
+        uint256 faceValue,
+        uint256 financedAt,
+        uint256 platformFeeOwed,
+        uint256 reserveFeeOwed,
+        bool addToOutstanding
+    ) external onlyOwner {
+        if (rorContract == address(0)) revert InvalidAddress();
+        if (faceValue == 0 || financedAt == 0) revert InvalidAmount();
+
+        bytes32 key = _financingKey(rorContract, tokenId, financingId);
+        // financedAt doubles as the existence marker (see collectPlatformFee).
+        if (financings[key].financedAt != 0) revert FinancingAlreadyExists(key);
+
+        financings[key] = FinancingRecord({
+            rorContract: rorContract,
+            rorTokenId: tokenId,
+            financingId: financingId,
+            wlpDeployed: wlpDeployed,
+            faceValue: faceValue,
+            financedAt: financedAt,
+            platformFeeOwed: platformFeeOwed,
+            reserveFeeOwed: reserveFeeOwed,
+            settled: false,
+            defaulted: false,
+            platformFeeCollected: false,
+            reserveFeeCollected: false
+        });
+
+        bytes32 tKey = _tokenKey(rorContract, tokenId);
+        tokenActiveFinancings[tKey].push(financingId);
+        if (financingId > nextFinancingId[tKey]) {
+            nextFinancingId[tKey] = financingId;
+        }
+
+        if (addToOutstanding) {
+            totalFinancedOutstanding += faceValue;
+        }
+
+        emit FinancingReindexed(rorContract, tokenId, financingId, faceValue);
+    }
+
+    /**
+     * @notice Set totalFinancedOutstanding to a reconciled absolute value.
+     * @dev Escape hatch for pools whose outstanding accumulator has drifted from the
+     *      true sum of open financings (e.g. from partially-applied operations before
+     *      a fix). correctValue MUST be computed off-chain as the sum of faceValue
+     *      over all currently-open (unsettled, non-defaulted) financings. Prefer
+     *      adminReindexFinancing; use this only to correct an already-drifted total.
+     */
+    function adminReconcileOutstanding(uint256 correctValue) external onlyOwner {
+        uint256 oldValue = totalFinancedOutstanding;
+        totalFinancedOutstanding = correctValue;
+        emit OutstandingReconciled(oldValue, correctValue);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //                       VIEW FUNCTIONS
     // ═══════════════════════════════════════════════════════════════
 
@@ -995,7 +1094,7 @@ contract SubPool is
      * @notice Get implementation version
      */
     function version() public pure virtual returns (string memory) {
-        return "1.4.0";
+        return "1.5.0";
     }
 
     // ═══════════════════════════════════════════════════════════════
