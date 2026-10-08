@@ -17,7 +17,7 @@ mediates buyer-side settlement flows.
 
 | Contract | File | Ver | Std | Pattern | Role |
 |---|---|---|---|---|---|
-| **SubPool** | `src/SubPool.sol` | 1.3.0 | — | UUPS · Ownable · Pausable · ReentrancyGuard · ERC1155Holder | Per-buyer investor liquidity pool: allocate/redeem, NAV oracle, supplier financing, settlement, fees, **investor allowlist** |
+| **SubPool** | `src/SubPool.sol` | 1.9.0 | — | UUPS · Ownable · Pausable · ReentrancyGuard · ERC1155Holder | Per-buyer investor liquidity pool: allocate/redeem, NAV oracle, supplier financing, settlement, fees, **investor allowlist** |
 | **WLP** | `src/WLP.sol` | 1.1.0 | ERC-20 | UUPS · Ownable · Pausable | Working Liquidity Pool token; owner-minted, fiat-backed |
 | **WTKN** | `src/WTKN.sol` | 2.0.0 | ERC-20 | UUPS · Ownable · Pausable | Per-anchor-buyer wrapped token with blacklist + transfer restrictions |
 | **ROR (V2)** | `src/ROR_ERC1155_V2.sol` | V2 | ERC-1155 | UUPS · AccessControl | Multi-tier receivable/invoice tokens with maturity + settlement lifecycle |
@@ -77,12 +77,26 @@ Reviewers should assess the **interactions**, not just each contract in isolatio
 - **Two products:**
   - **Participatory** (type 0): open-ended; uses pool-level lock-up and minimum.
   - **Series** (type 1): fixed tranches, each with its own lock-up, subscription
-    window (start/end), max size, and minimum allocation.
+    window (start/end), max size, and minimum allocation. A Series has a **Net
+    Investor Rate** (`seriesNirBps`, its *maximum* return, set once when its
+    window opens — this freezes its terms) and a single issue NAV (`seriesEntryNav`,
+    fixed by its first allocation). Its **Maximum Redemption Price** is
+    `MRP = floor4(NAV₀ · (1 + NIR · (endDate − startDate) / 365 days))`.
+    There is **no Reserve Fund and no top-up** (v1.9.0): at maturity the owner
+    fixes `seriesMaturityNav` (only after that day's NAV push) and redeems each
+    allocation with `redeemSeries` at **`min(MRP, NAV_m)`**, in full or in
+    instalments. Above the MRP the surplus stays in the pool (Participatory
+    holders); below it the Series investor bears the shortfall. Investors cannot
+    call `redeem`/`redeemEarly` on a Series allocation.
 - **NAV appreciation = yield.** The backend pushes NAV daily (oracle). Financing
   profit and injected interest income (`receiveInterest`) raise pool value without
   minting new units, so NAV rises and existing holders capture the return.
+- **Precision (v1.9.0).** NAV is exactly 4 dp (`updateNav` rejects anything else);
+  units issued and every WLP payout are rounded **down** to whole cents (2 dp), the
+  remainder staying in the pool; amounts passed in (allocation, partial redeem
+  units, financing, settlement, interest) must already be whole cents.
 - **Lock-up & redemption.** Each allocation is locked until its `lockUpEndsAt`.
-  `redeem()` returns `units · currentNav / 1e18` in WLP. `redeemEarly()` (before the
+  `redeem()` returns `units · currentNav / 1e18` in WLP (Participatory only). `redeemEarly()` (before the
   lock-up) applies `earlyExitPenaltyBps`; the penalty **stays in the pool**, so it
   accretes to the remaining investors via NAV.
 - **Capacity.** `maxPoolSize` caps total WLP the pool will accept.
@@ -101,6 +115,11 @@ Reviewers should assess the **interactions**, not just each contract in isolatio
   outstanding and is absorbed as a **NAV drop** — i.e. investors bear the credit
   risk of the receivables, pro-rata.
 - **Fees.** `collectPlatformFee` transfers WLP to the platform/trustee fee wallet.
+  The Reserve Fund was removed in v1.9.0: `financeSupplier` reverts on a non-zero
+  `reserveFee` (the parameter stays for ABI compatibility), new pools pass a zero
+  reserve wallet, and fees earmarked before the upgrade are returned to the
+  pool's capital with `releaseReserveFeeToPool` (`collectReserveFund` remains,
+  but the platform no longer uses it).
 
 ### WLP — the unit of account
 Stable-value ERC-20 (≈ 1:1 to fiat, e.g. RM), owner-minted against off-chain
@@ -152,6 +171,11 @@ across upgrades**:
   trailing `uint256[50] __gap`. Please verify the layout is strictly append-only vs.
   the currently-deployed v1.2.0 (no reordering/insertion) so live pools upgrade
   without storage corruption.
+- **SubPool → v1.9.0** (this release): appends `seriesNirBps`, `seriesEntryNav`
+  and `seriesMaturityNav` (top-level mappings, slots 479–481) after
+  `unitsRedeemedOf`, shrinking `__gap` 45 → 42; the `Allocation` and `Series`
+  structs are unchanged. `migrateV5` (`reinitializer(5)`) is emit-only; Series
+  allocated before the upgrade are back-filled once via `adminSetSeriesLegacyTerms`.
 - Confirm each contract's initializer cannot be re-invoked and that
   `_disableInitializers()` is set in constructors.
 
@@ -201,7 +225,7 @@ via_ir = true
 nexa_contracts_audit/
 ├── README.md
 └── src/
-    ├── SubPool.sol                 # audit target (946 LOC)
+    ├── SubPool.sol                 # audit target (1650 LOC)
     ├── WLP.sol                     # audit target (223 LOC)
     ├── WTKN.sol                    # audit target (344 LOC)
     ├── ROR_ERC1155_V2.sol          # audit target (482 LOC)
@@ -217,11 +241,14 @@ Total in-scope: **~2,400 LOC** across 7 files (4 targets + 3 dependencies).
 ---
 
 ## Suggested focus areas
-1. **Storage-layout compatibility** on the SubPool v1.2.0→v1.3.0 UUPS upgrade (see above).
-2. **NAV & unit accounting** — allocate/redeem math, rounding, early-exit penalty,
+1. **Storage-layout compatibility** on the SubPool upgrades (see above), incl. v1.9.0.
+2. **Series redemption at min(MRP, NAV_m)** — MRP math and rounding, the one-time
+   NAV_m fix (stale-NAV guard), instalment (`redeemSeries` partial) accounting,
+   the legacy back-fill, and that no path pays a Series more than min(MRP, NAV_m).
+3. **NAV & unit accounting** — allocate/redeem math, rounding, early-exit penalty,
    `totalWlpBalance` vs actual token balance drift.
-3. **Financing & settlement** — utilisation cap, default write-offs, ROR faceValue
+4. **Financing & settlement** — utilisation cap, default write-offs, ROR faceValue
    vs deployed WLP, re-entrancy on external token calls (CEI ordering).
-4. **Access control & upgrade authorization** across all four contracts.
+5. **Access control & upgrade authorization** across all four contracts.
 5. **WTKN transfer restrictions & blacklist** — can they wedge settlement or trap funds?
 6. **Investor allowlist** — the on-chain gate vs. the off-chain (operator) trust model.

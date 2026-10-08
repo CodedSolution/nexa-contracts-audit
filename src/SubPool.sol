@@ -34,12 +34,23 @@ contract SubPool is
     //                          STRUCTS
     // ═══════════════════════════════════════════════════════════════
 
+    // ⚠️ DO NOT add fields here. This struct is the ELEMENT TYPE of a DYNAMIC
+    // ARRAY (`_allocations`, below) — unlike a struct used as a mapping's VALUE
+    // type, array elements are NOT independently content-addressed. They sit at
+    // sequential offsets `base + index * elementSizeInSlots`. Changing this
+    // struct's size retroactively breaks the offset math for every EXISTING
+    // element at index >= 1 (index 0 alone survives, since 0 * anything = 0) —
+    // reads (and writes) silently land on the wrong allocation's old data. This
+    // exact mistake shipped once already (a `unitsRedeemed` field appended here)
+    // and corrupted every pre-upgrade multi-allocation investor's storage; see
+    // migrateV4. Track any new per-allocation value in a SEPARATE top-level
+    // mapping instead (e.g. `unitsRedeemedOf`, below) — those are safe to add.
     struct Allocation {
         uint256 wlpAmount;       // WLP deposited by investor
         uint256 unitsIssued;     // Units transferred to investor
         uint256 allocatedAt;     // Block timestamp of allocation
-        uint256 lockUpEndsAt;    // allocatedAt + lockUpSeconds (per-allocation)
-        bool redeemed;           // Whether this allocation has been redeemed
+        uint256 lockUpEndsAt;    // Series: series endDate (series-wide maturity); Participatory: allocatedAt + lockUpSeconds
+        bool redeemed;           // Whether this allocation has been FULLY redeemed (terminal — see _remaining)
         uint8 investmentType;    // 0 = Participatory, 1 = Series
         uint256 seriesId;        // Series ID (0 for Participatory)
     }
@@ -134,10 +145,45 @@ contract SubPool is
     // token can be financed repeatedly without collisions or an external source.
     mapping(bytes32 => uint256) public nextFinancingId;
 
+    // ─── Partial Redemption ───
+    // Appended after all prior state (and consuming one more slot from __gap).
+    // A fresh top-level mapping — content-addressed by keccak256(investor .
+    // allocationIndex . slot), independent of `_allocations`'s own layout — is
+    // the SAFE way to attach a new per-allocation value after the fact. Do NOT
+    // add this field to the Allocation struct itself; see the struct's own
+    // warning comment for why that corrupts existing array elements.
+    mapping(address => mapping(uint256 => uint256)) public unitsRedeemedOf;
+
+    // ─── Series redemption at min(MRP, NAV) (v1.9.0, no Reserve Fund) ───
+    // Appended after all prior state (consuming three slots from __gap). Top-level
+    // mappings keyed by seriesId, so neither the Allocation nor the Series struct
+    // changes (see the Allocation struct's warning).
+    //
+    // Net Investor Rate — the MAXIMUM annual return of a Series — in basis points
+    // (600 = 6.00%). Set once, when the Series' subscription window opens; from
+    // then on the Series' terms are frozen.
+    mapping(uint256 => uint256) public seriesNirBps;
+    // NAV per unit at which the whole Series is issued (NAV₀), fixed by its first
+    // allocation. Every allocation into the Series is issued at, and its Maximum
+    // Redemption Price is computed from, this one NAV.
+    mapping(uint256 => uint256) public seriesEntryNav;
+    // NAV per unit on the Series' maturity date (NAV_m), fixed once on or after
+    // maturity. 0 = not fixed yet. Every unit of the Series redeems at
+    // min(MRP, NAV_m), however long payment takes.
+    mapping(uint256 => uint256) public seriesMaturityNav;
+
     // ─── Storage Gap ───
-    // Reduced from 50 → 46 to account for the 4 slots consumed above, keeping
-    // the total reserved storage footprint constant across this upgrade.
-    uint256[46] private __gap;
+    // Reduced from 45 → 42 for the 3 slots consumed above, keeping the total
+    // reserved storage footprint constant across this upgrade.
+    uint256[42] private __gap;
+
+    // ─── Precision (constants: no storage) ───
+    // LP token amounts and units move in whole cents (2 dp). NAV per unit and
+    // the Maximum Redemption Price are 4 dp. Values computed here are rounded
+    // down (in favour of the pool); values passed in must already be exact.
+    uint256 private constant CENT = 1e16;
+    uint256 private constant NAV_STEP = 1e14;
+    uint256 private constant BPS_YEAR = 10_000 * 365 days;
 
     // ═══════════════════════════════════════════════════════════════
     //                           EVENTS
@@ -158,7 +204,8 @@ contract SubPool is
         uint256 unitsReturned,
         uint256 wlpReturned,
         uint256 allocationIndex,
-        bool early
+        bool early,
+        uint256 remainingUnits
     );
     event SupplierFinanced(
         address indexed supplier,
@@ -181,6 +228,7 @@ contract SubPool is
     event PlatformFeeCollected(address indexed rorContract, uint256 indexed tokenId, uint256 indexed financingId, uint256 amount, address feeWallet);
     event ReserveFundCollected(address indexed rorContract, uint256 indexed tokenId, uint256 indexed financingId, uint256 amount, address reserveFundWallet);
     event ReserveFundWalletUpdated(address oldWallet, address newWallet);
+    event ReserveFeeReleasedToPool(address indexed rorContract, uint256 indexed tokenId, uint256 indexed financingId, uint256 amount);
     event InterestReceived(uint256 wlpAmount);
     event MaxPoolSizeUpdated(uint256 oldSize, uint256 newSize);
     event LockUpDurationUpdated(uint256 oldDuration, uint256 newDuration);
@@ -199,6 +247,20 @@ contract SubPool is
     event FinancingReindexed(address indexed rorContract, uint256 indexed tokenId, uint256 financingId, uint256 faceValue);
     event OutstandingReconciled(uint256 oldValue, uint256 newValue);
     event Migrated(uint64 version);
+    // Series redemption at min(MRP, NAV)
+    event SeriesNirSet(uint256 indexed seriesId, uint256 nirBps);
+    event SeriesEntryNavSet(uint256 indexed seriesId, uint256 entryNav);
+    event SeriesMaturityNavFixed(uint256 indexed seriesId, uint256 maturityNav);
+    event SeriesLegacyTermsSet(uint256 indexed seriesId, uint256 nirBps, uint256 entryNav, uint256 maturityNav);
+    event SeriesRedeemed(
+        address indexed investor,
+        uint256 allocationIndex,
+        uint256 indexed seriesId,
+        uint256 units,
+        uint256 pricePerUnit,
+        uint256 wlpPaid,
+        uint256 remainingUnits
+    );
 
     // ═══════════════════════════════════════════════════════════════
     //                           ERRORS
@@ -212,6 +274,7 @@ contract SubPool is
     error AllocationAlreadyRedeemed();
     error AllocationIndexOutOfBounds();
     error InsufficientLiquidity(uint256 available, uint256 required);
+    error InsufficientRemainingUnits(uint256 remaining, uint256 requested);
     error PoolSizeExceeded(uint256 newSize, uint256 maxSize);
     error UtilisationExceeded(uint256 currentUtilisation, uint256 maxUtilisation);
     error FinancingAlreadyExists(bytes32 key);
@@ -227,6 +290,20 @@ contract SubPool is
     error SeriesMaxSizeExceeded(uint256 seriesId, uint256 available, uint256 requested);
     error InvalidSeriesConfig();
     error NotWhitelisted(address investor);
+    error AmountPrecision(uint256 amount);
+    error NavPrecision(uint256 nav);
+    error ReserveFeeDisabled();
+    error UseRedeemSeries();
+    error NotSeriesAllocation();
+    error SeriesNirNotSet(uint256 seriesId);
+    error SeriesNirAlreadySet(uint256 seriesId);
+    error SeriesTermsFrozen(uint256 seriesId);
+    error SeriesNotMatured(uint256 seriesId, uint256 maturity);
+    error SeriesNavStale(uint256 navTimestamp, uint256 maturity);
+    error SeriesMaturityNavNotFixed(uint256 seriesId);
+    error SeriesMaturityNavAlreadyFixed(uint256 seriesId);
+    error EntryNavNotSet(uint256 seriesId);
+    error LegacyTermsNotAllowed(uint256 seriesId);
 
     // ═══════════════════════════════════════════════════════════════
     //                        CONSTRUCTOR
@@ -271,10 +348,20 @@ contract SubPool is
     ) public initializer {
         if (_wlpToken == address(0)) revert InvalidAddress();
         if (_feeWallet == address(0)) revert InvalidAddress();
-        if (_reserveFundWallet == address(0)) revert InvalidAddress();
-        if (_reserveFundWallet == _feeWallet) revert InvalidAddress();
+        // Reserve Fund removed: new pools pass address(0). A non-zero wallet is
+        // still accepted (and validated) so an older deploy script keeps working.
+        if (_reserveFundWallet != address(0) && _reserveFundWallet == _feeWallet) revert InvalidAddress();
+        // Fee/reserve wallets must not be the pool itself: collecting to address(this)
+        // is a no-op self-transfer that marks the fee collected while the tokens stay
+        // in the contract — excluded from totalWlpBalance and unrecoverable (stranded).
+        if (_feeWallet == address(this)) revert InvalidAddress();
+        if (_reserveFundWallet != address(0) && _reserveFundWallet == address(this)) revert InvalidAddress();
         if (_owner == address(0)) revert InvalidAddress();
         if (_maxPoolSize == 0) revert InvalidAmount();
+        // Minimum allocation must fit inside the pool cap, otherwise every
+        // allocation fails BelowMinimumAllocation-or-PoolSizeExceeded and the
+        // pool can never accept a participatory allocation.
+        if (_minimumAllocation > _maxPoolSize) revert InvalidAmount();
         if (_maxUtilisationBps == 0 || _maxUtilisationBps > 10000) revert InvalidBps();
         if (_earlyExitPenaltyBps > 5000) revert InvalidBps(); // Max 50% penalty
 
@@ -331,10 +418,19 @@ contract SubPool is
      */
     function allocate(uint256 wlpAmount, uint8 investmentType, uint256 seriesId) external onlyWhitelisted whenNotPaused nonReentrant {
         if (wlpAmount == 0) revert InvalidAmount();
+        if (wlpAmount % CENT != 0) revert AmountPrecision(wlpAmount);
         if (currentNav == 0) revert NavNotSet();
         if (investmentType > 1) revert InvalidAmount();
 
         uint256 lockUpSeconds;
+        // For a Series, the lock-up ends on the series' fixed maturity (endDate)
+        // so every subscriber matures on the SAME calendar date regardless of
+        // when they allocated within the window. 0 = unset (Participatory, or a
+        // Series created with no endDate → fall back to the rolling lock-up).
+        uint256 seriesEndDate = 0;
+        // NAV the units are issued at: the live NAV for Participatory, the
+        // Series' own fixed NAV₀ for a Series.
+        uint256 issueNav = currentNav;
 
         if (investmentType == 0) {
             // Participatory — use pool-level lock-up and minimum
@@ -346,6 +442,9 @@ contract SubPool is
             Series storage s = seriesRegistry[seriesId];
             if (!s.active) revert SeriesNotActive(seriesId);
             if (s.lockUpSeconds == 0) revert SeriesNotFound(seriesId);
+            // Every Series unit needs a Maximum Redemption Price, so a Series
+            // cannot take money before its Net Investor Rate is set.
+            if (seriesNirBps[seriesId] == 0) revert SeriesNirNotSet(seriesId);
             if (block.timestamp < s.startDate) revert SeriesNotStarted(seriesId, s.startDate);
             if (s.endDate > 0 && block.timestamp > s.endDate) revert SeriesEnded(seriesId, s.endDate);
             if (s.minAllocation > 0 && wlpAmount < s.minAllocation) revert BelowMinimumAllocation(wlpAmount, s.minAllocation);
@@ -362,10 +461,19 @@ contract SubPool is
                 s.totalAllocated += wlpAmount;
             }
             lockUpSeconds = s.lockUpSeconds;
+            seriesEndDate = s.endDate;
+            // The first allocation fixes the Series' NAV₀; later ones (e.g. a
+            // retried allocation after a NAV push) are issued at the same NAV, so
+            // every investor in the Series shares one NAV₀ and one MRP.
+            if (seriesEntryNav[seriesId] == 0) {
+                seriesEntryNav[seriesId] = currentNav;
+                emit SeriesEntryNavSet(seriesId, currentNav);
+            }
+            issueNav = seriesEntryNav[seriesId];
         }
 
-        // Calculate units to issue: units = wlpAmount * 1e18 / currentNav
-        uint256 unitsToIssue = (wlpAmount * 1e18) / currentNav;
+        // Units to issue: wlpAmount * 1e18 / NAV, rounded down to whole cents.
+        uint256 unitsToIssue = _floor2((wlpAmount * 1e18) / issueNav);
         if (unitsToIssue == 0) revert InvalidAmount();
 
         // Check pool size cap (total WLP in pool must not exceed maxPoolSize)
@@ -382,8 +490,16 @@ contract SubPool is
         // Update pool accounting
         totalWlpBalance += wlpAmount;
 
-        // Record allocation
-        uint256 lockUpEndsAt = block.timestamp + lockUpSeconds;
+        // Record allocation. Series allocations mature on the series' fixed
+        // endDate (series-wide maturity) so on-chain expiry matches the backend's
+        // startDate-anchored maturityDate; Participatory uses a rolling lock-up
+        // from the allocation time. A Series with endDate == 0 falls back to the
+        // rolling lock-up so an expiry is always enforced. endDate >= block.timestamp
+        // is guaranteed here by the SeriesEnded check above, so lockUpEndsAt is
+        // never back-dated for a fresh allocation.
+        uint256 lockUpEndsAt = seriesEndDate > 0
+            ? seriesEndDate
+            : block.timestamp + lockUpSeconds;
         _allocations[msg.sender].push(Allocation({
             wlpAmount: wlpAmount,
             unitsIssued: unitsToIssue,
@@ -400,19 +516,37 @@ contract SubPool is
     }
 
     /**
-     * @notice Redeem an allocation after lock-up period has expired
+     * @notice Redeem an allocation's full remaining balance after lock-up has expired
      * @param allocationIndex Index of the allocation to redeem
      */
     function redeem(uint256 allocationIndex) external whenNotPaused nonReentrant {
-        _redeem(msg.sender, allocationIndex, false);
+        _redeem(msg.sender, allocationIndex, false, 0);
     }
 
     /**
-     * @notice Redeem an allocation before lock-up expires (with penalty)
+     * @notice Redeem part or all of an allocation's remaining balance after lock-up has expired
+     * @param allocationIndex Index of the allocation to redeem
+     * @param amount Units to redeem; must be <= the allocation's remaining (unredeemed) units
+     */
+    function redeem(uint256 allocationIndex, uint256 amount) external whenNotPaused nonReentrant {
+        _redeem(msg.sender, allocationIndex, false, amount);
+    }
+
+    /**
+     * @notice Redeem an allocation's full remaining balance before lock-up expires (with penalty)
      * @param allocationIndex Index of the allocation to redeem early
      */
     function redeemEarly(uint256 allocationIndex) external whenNotPaused nonReentrant {
-        _redeem(msg.sender, allocationIndex, true);
+        _redeem(msg.sender, allocationIndex, true, 0);
+    }
+
+    /**
+     * @notice Redeem part or all of an allocation's remaining balance before lock-up expires (with penalty)
+     * @param allocationIndex Index of the allocation to redeem early
+     * @param amount Units to redeem; must be <= the allocation's remaining (unredeemed) units
+     */
+    function redeemEarly(uint256 allocationIndex, uint256 amount) external whenNotPaused nonReentrant {
+        _redeem(msg.sender, allocationIndex, true, amount);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -428,6 +562,8 @@ contract SubPool is
         // Floor: 0.001e18 — prevents unit overflow on allocation.
         // Ceiling: 1000e18 — prevents redemptions returning near-zero WLP.
         if (newNav < 1e15 || newNav > 1000e18) revert InvalidAmount();
+        // NAV per unit is published to exactly 4 decimal places.
+        if (newNav % NAV_STEP != 0) revert NavPrecision(newNav);
 
         uint256 prev = currentNav;
         currentNav = newNav;
@@ -452,7 +588,8 @@ contract SubPool is
      * @param wlpAmount Discounted WLP amount to send to supplier
      * @param faceValue Full face value expected at maturity
      * @param platformFee Platform fee earmarked from the discount (swept via collectPlatformFee)
-     * @param reserveFee Reserve fund fee earmarked from the discount (swept via collectReserveFund)
+     * @param reserveFee Must be 0: the Reserve Fund was removed. Kept in the
+     *        signature so existing callers' ABI does not change.
      * @return financingId Pool-assigned id, unique per token; carried in SupplierFinanced
      */
     function financeSupplier(
@@ -468,6 +605,10 @@ contract SubPool is
         if (rorContract == address(0)) revert InvalidAddress();
         if (wlpAmount == 0 || faceValue == 0) revert InvalidAmount();
         if (faceValue < wlpAmount) revert InvalidAmount();
+        if (reserveFee != 0) revert ReserveFeeDisabled();
+        if (wlpAmount % CENT != 0) revert AmountPrecision(wlpAmount);
+        if (faceValue % CENT != 0) revert AmountPrecision(faceValue);
+        if (platformFee % CENT != 0) revert AmountPrecision(platformFee);
 
         // The pool assigns its own financingId per token (like ROR nextFinancingId),
         // so a token can be financed repeatedly with no key collision and no
@@ -489,6 +630,13 @@ contract SubPool is
         // The discount retained in the pool must cover both the fees we earmark
         // and still leave the amount sent to the supplier backed by real capital.
         uint256 totalCommit = wlpAmount + platformFee + reserveFee;
+
+        // Fees must come out of the discount, never investor principal: the face
+        // value has to cover the amount sent to the supplier plus both earmarked
+        // fees. Without this, platformFee + reserveFee > (faceValue - wlpAmount)
+        // would drop poolValue at origination and drain principal via fee sweeps.
+        // (Strictly stronger than the faceValue < wlpAmount check above.)
+        if (faceValue < totalCommit) revert InvalidAmount();
 
         // Verify tracked balance matches actual contract balance to detect drift.
         // Use the lesser of the two as the available liquidity so we never
@@ -539,6 +687,7 @@ contract SubPool is
         uint256 wlpAmount
     ) external onlyOwner whenNotPaused {
         if (wlpAmount == 0) revert InvalidAmount();
+        if (wlpAmount % CENT != 0) revert AmountPrecision(wlpAmount);
 
         // The buyer settles the whole token at once. Settle every currently
         // active financing on it in one call — no per-financing id required.
@@ -570,6 +719,7 @@ contract SubPool is
      */
     function receiveInterest(uint256 wlpAmount) external onlyOwner whenNotPaused {
         if (wlpAmount == 0) revert InvalidAmount();
+        if (wlpAmount % CENT != 0) revert AmountPrecision(wlpAmount);
 
         totalWlpBalance += wlpAmount;
 
@@ -675,12 +825,42 @@ contract SubPool is
     }
 
     /**
+     * @notice Release a reserve fee earmarked before the Reserve Fund was removed
+     *         back into the pool (v1.9.0). The WLP never left the contract — it
+     *         was only excluded from totalWlpBalance — so this adds it back to
+     *         the pool's capital, lifting NAV for the pool's unit holders. The
+     *         financing's reserve fee is then marked collected, so it can never
+     *         also be swept to a reserve wallet.
+     * @param rorContract ROR ERC1155 contract address
+     * @param tokenId ROR token ID
+     * @param financingId ROR financingId identifying the financing
+     */
+    function releaseReserveFeeToPool(
+        address rorContract,
+        uint256 tokenId,
+        uint256 financingId
+    ) external onlyOwner whenNotPaused {
+        bytes32 key = _financingKey(rorContract, tokenId, financingId);
+        FinancingRecord storage f = financings[key];
+        if (f.financedAt == 0) revert FinancingNotFound(key);
+        if (f.reserveFeeCollected) revert FeesAlreadyCollected(key);
+
+        uint256 amount = f.reserveFeeOwed;
+        f.reserveFeeCollected = true;
+        totalWlpBalance += amount;
+
+        emit ReserveFeeReleasedToPool(rorContract, tokenId, financingId, amount);
+    }
+
+    /**
      * @notice Update the reserve fund wallet (owner only).
      * @param newWallet New reserve fund wallet address
      */
     function setReserveFundWallet(address newWallet) external onlyOwner {
         if (newWallet == address(0)) revert InvalidAddress();
         if (newWallet == feeWallet) revert InvalidAddress();
+        // Never the pool itself: a self-transfer on collection strands the fee.
+        if (newWallet == address(this)) revert InvalidAddress();
         address oldWallet = reserveFundWallet;
         reserveFundWallet = newWallet;
         emit ReserveFundWalletUpdated(oldWallet, newWallet);
@@ -692,6 +872,9 @@ contract SubPool is
      */
     function setMaxPoolSize(uint256 newSize) external onlyOwner {
         if (newSize == 0) revert InvalidAmount();
+        // Keep the invariant minimumAllocation <= maxPoolSize: lowering the cap
+        // below the current minimum would brick new allocations.
+        if (newSize < minimumAllocation) revert InvalidAmount();
 
         uint256 oldSize = maxPoolSize;
         maxPoolSize = newSize;
@@ -772,12 +955,21 @@ contract SubPool is
 
     function setFeeWallet(address newWallet) external onlyOwner {
         if (newWallet == address(0)) revert InvalidAddress();
+        // Never the pool itself (a self-transfer on collection strands the fee),
+        // nor the reserve wallet (mirrors setReserveFundWallet's cross-check).
+        if (newWallet == address(this)) revert InvalidAddress();
+        if (newWallet == reserveFundWallet) revert InvalidAddress();
         address oldWallet = feeWallet;
         feeWallet = newWallet;
         emit FeeWalletUpdated(oldWallet, newWallet);
     }
 
     function setMinimumAllocation(uint256 newMinimum) external onlyOwner {
+        // Must fit inside the pool cap, else every allocation reverts
+        // (BelowMinimumAllocation below it, PoolSizeExceeded at/above it) and the
+        // pool can never accept a participatory allocation. Equal is allowed
+        // (a single allocation can fill the whole pool).
+        if (newMinimum > maxPoolSize) revert InvalidAmount();
         uint256 oldMinimum = minimumAllocation;
         minimumAllocation = newMinimum;
         emit MinimumAllocationUpdated(oldMinimum, newMinimum);
@@ -873,6 +1065,9 @@ contract SubPool is
     ) external onlyOwner {
         Series storage s = seriesRegistry[seriesId];
         if (s.lockUpSeconds == 0) revert SeriesNotFound(seriesId);
+        // Terms are frozen once the subscription window opens (the NIR is set
+        // then): the maturity date feeds the MRP and must not move.
+        if (seriesNirBps[seriesId] != 0) revert SeriesTermsFrozen(seriesId);
 
         // startDate == 0 is the documented "keep existing" sentinel. Honor it so
         // routine updates to other fields don't overwrite startDate with the Unix
@@ -900,6 +1095,137 @@ contract SubPool is
         emit SeriesDeactivated(seriesId);
     }
 
+    // ─── Series redemption at min(MRP, NAV) ───────────────────────────
+    // There is no Reserve Fund and no top-up: a matured Series unit is paid
+    // min(Maximum Redemption Price, NAV per unit on the maturity date). Above
+    // the MRP the surplus stays in the pool; below it the investor bears the
+    // shortfall. Payment is from this pool's own WLP only.
+
+    /**
+     * @notice Set a Series' Net Investor Rate (its maximum annual return). Called
+     *         when the Series' subscription window opens; this freezes its terms.
+     * @param seriesId Series to set
+     * @param nirBps Net Investor Rate in basis points (600 = 6.00%), at most 50%
+     */
+    function setSeriesNir(uint256 seriesId, uint256 nirBps) external onlyOwner {
+        Series storage s = seriesRegistry[seriesId];
+        if (s.lockUpSeconds == 0) revert SeriesNotFound(seriesId);
+        if (seriesNirBps[seriesId] != 0) revert SeriesNirAlreadySet(seriesId);
+        if (nirBps == 0 || nirBps > 5000) revert InvalidBps();
+        // The MRP is accrued from deployment (startDate) to maturity (endDate).
+        if (s.endDate <= s.startDate) revert InvalidSeriesConfig();
+        if (block.timestamp >= s.endDate) revert SeriesEnded(seriesId, s.endDate);
+
+        seriesNirBps[seriesId] = nirBps;
+        emit SeriesNirSet(seriesId, nirBps);
+    }
+
+    /**
+     * @notice Fix a matured Series' NAV per unit (NAV_m) from the current NAV.
+     *         Must run after the maturity date's NAV has been pushed, so a stale
+     *         NAV can never price the Series. Every unit of the Series then
+     *         redeems at min(MRP, NAV_m), whenever it is paid.
+     * @dev Not called while a Credit Event Hold applies (decided off-chain).
+     */
+    function fixSeriesMaturityNav(uint256 seriesId) external onlyOwner {
+        Series storage s = seriesRegistry[seriesId];
+        if (s.lockUpSeconds == 0) revert SeriesNotFound(seriesId);
+        if (seriesNirBps[seriesId] == 0) revert SeriesNirNotSet(seriesId);
+        if (seriesMaturityNav[seriesId] != 0) revert SeriesMaturityNavAlreadyFixed(seriesId);
+        if (block.timestamp < s.endDate) revert SeriesNotMatured(seriesId, s.endDate);
+        if (navTimestamp < s.endDate) revert SeriesNavStale(navTimestamp, s.endDate);
+
+        seriesMaturityNav[seriesId] = currentNav;
+        emit SeriesMaturityNavFixed(seriesId, currentNav);
+    }
+
+    /**
+     * @notice Redeem a matured Series allocation (all or part) at
+     *         min(MRP, NAV_m), paying the investor's own wallet.
+     * @param investor Allocation owner
+     * @param allocationIndex Index of the investor's allocation
+     * @param units Units to redeem, in whole cents; 0 = the full remainder.
+     *        A partial amount supports paying a Series in instalments when the
+     *        pool does not yet hold enough WLP for all of it.
+     */
+    function redeemSeries(address investor, uint256 allocationIndex, uint256 units)
+        external
+        onlyOwner
+        whenNotPaused
+        nonReentrant
+    {
+        if (allocationIndex >= _allocations[investor].length) revert AllocationIndexOutOfBounds();
+        Allocation storage alloc = _allocations[investor][allocationIndex];
+        if (alloc.investmentType != 1) revert NotSeriesAllocation();
+        uint256 seriesId = alloc.seriesId;
+        if (seriesMaturityNav[seriesId] == 0) revert SeriesMaturityNavNotFixed(seriesId);
+
+        uint256 remaining = _remaining(alloc, investor, allocationIndex);
+        if (remaining == 0) revert AllocationAlreadyRedeemed();
+        if (units != 0 && units % CENT != 0) revert AmountPrecision(units);
+        uint256 toRedeem = units == 0 ? remaining : units;
+        if (toRedeem > remaining) revert InsufficientRemainingUnits(remaining, toRedeem);
+
+        uint256 price = _seriesRedemptionPrice(seriesId);
+        uint256 wlp = _floor2((toRedeem * price) / 1e18);
+        if (totalWlpBalance < wlp) revert InsufficientLiquidity(totalWlpBalance, wlp);
+
+        uint256 newUnitsRedeemed = unitsRedeemedOf[investor][allocationIndex] + toRedeem;
+        unitsRedeemedOf[investor][allocationIndex] = newUnitsRedeemed;
+        if (newUnitsRedeemed >= alloc.unitsIssued) {
+            alloc.redeemed = true;
+        }
+
+        unitBalanceOf[investor] -= toRedeem;
+        totalUnitsInCirculation -= toRedeem;
+        // Only what is paid leaves the pool: above the MRP, the surplus stays in
+        // totalWlpBalance and lifts NAV for the remaining unit holders.
+        totalWlpBalance -= wlp;
+
+        wlpToken.safeTransfer(investor, wlp);
+
+        uint256 left = alloc.unitsIssued - newUnitsRedeemed;
+        emit SeriesRedeemed(investor, allocationIndex, seriesId, toRedeem, price, wlp, left);
+        // Also the generic event, so existing listeners keep working.
+        emit Redeemed(investor, toRedeem, wlp, allocationIndex, false, left);
+    }
+
+    /**
+     * @notice Back-fill the terms of a Series that took allocations BEFORE this
+     *         upgrade (it has no NIR or entry NAV on-chain). One-shot.
+     * @param seriesId Series to back-fill
+     * @param nirBps Its Net Investor Rate, in basis points
+     * @param entryNav Its NAV₀ (4 dp), from the off-chain record
+     * @param maturityNav Its NAV on the maturity date (4 dp) if it has already
+     *        matured — from that date's NAV snapshot, never today's NAV; 0 if not
+     */
+    function adminSetSeriesLegacyTerms(
+        uint256 seriesId,
+        uint256 nirBps,
+        uint256 entryNav,
+        uint256 maturityNav
+    ) external onlyOwner {
+        Series storage s = seriesRegistry[seriesId];
+        if (s.lockUpSeconds == 0) revert SeriesNotFound(seriesId);
+        // Only a Series allocated before the upgrade: after it, the first
+        // allocation always records seriesEntryNav.
+        if (s.totalAllocated == 0 || seriesEntryNav[seriesId] != 0 || seriesNirBps[seriesId] != 0) {
+            revert LegacyTermsNotAllowed(seriesId);
+        }
+        if (nirBps == 0 || nirBps > 5000) revert InvalidBps();
+        if (s.endDate <= s.startDate) revert InvalidSeriesConfig();
+        if (entryNav == 0 || entryNav % NAV_STEP != 0) revert NavPrecision(entryNav);
+        if (maturityNav != 0) {
+            if (maturityNav % NAV_STEP != 0) revert NavPrecision(maturityNav);
+            if (block.timestamp < s.endDate) revert SeriesNotMatured(seriesId, s.endDate);
+        }
+
+        seriesNirBps[seriesId] = nirBps;
+        seriesEntryNav[seriesId] = entryNav;
+        if (maturityNav != 0) seriesMaturityNav[seriesId] = maturityNav;
+        emit SeriesLegacyTermsSet(seriesId, nirBps, entryNav, maturityNav);
+    }
+
     function pause() external onlyOwner {
         _pause();
     }
@@ -923,6 +1249,54 @@ contract SubPool is
      */
     function migrateV2() external onlyOwner reinitializer(2) {
         emit Migrated(2);
+    }
+
+    /**
+     * @notice SUPERSEDED BY migrateV4 — do not use for any pool that hasn't
+     *         already consumed this reinitializer slot. Kept only because some
+     *         pools already ran it and reinitializer slots can't be re-run.
+     * @dev This shipped a BUG: it appended `unitsRedeemed` directly onto the
+     *      `Allocation` struct, which is the element type of a dynamic array
+     *      (`_allocations`). Array elements are stored at sequential offsets
+     *      derived from the struct's SIZE, so growing the struct silently
+     *      corrupted every pre-existing allocation at index >= 1 for any
+     *      investor who had more than one allocation before this ran (index 0
+     *      alone survives, since its offset is 0 regardless of element size).
+     *      migrateV4 reverts the struct to its original size and moves the new
+     *      value into a separately-addressed mapping (`unitsRedeemedOf`),
+     *      which self-heals this corruption on re-upgrade — see migrateV4.
+     */
+    function migrateV3() external onlyOwner reinitializer(3) {
+        emit Migrated(3);
+    }
+
+    /**
+     * @notice Fixes the storage-corrupting bug shipped in migrateV3 (see its
+     *         comment). Run via upgradeToAndCall(newImpl, abi.encodeCall(SubPool.migrateV4, ())).
+     * @dev No backfill needed — the Allocation struct is simply back to its
+     *      original size, so existing array reads automatically realign with
+     *      whatever was written before ANY upgrade. `unitsRedeemedOf` starts
+     *      at 0 for everyone, which is correct EXCEPT for units genuinely
+     *      redeemed while a pool ran the buggy migrateV3 implementation (that
+     *      progress lived in the now-removed struct field and is unrecoverable
+     *      by this migration alone — reconcile from off-chain records if any
+     *      pool actually had redemptions confirm while on that version).
+     *      Safe to call whether a pool already ran migrateV3 or is coming
+     *      straight from an earlier version — reinitializer(4) only requires
+     *      _initialized < 4, true in both cases. onlyOwner, runs exactly once.
+     */
+    function migrateV4() external onlyOwner reinitializer(4) {
+        emit Migrated(4);
+    }
+
+    /**
+     * @notice v1.9.0 — Series redeem at min(MRP, NAV); no Reserve Fund.
+     * @dev Appends seriesNirBps, seriesEntryNav and seriesMaturityNav (from
+     *      __gap), all zero after the upgrade. Series that already took
+     *      allocations are back-filled with adminSetSeriesLegacyTerms.
+     */
+    function migrateV5() external onlyOwner reinitializer(5) {
+        emit Migrated(5);
     }
 
     /**
@@ -1053,8 +1427,8 @@ contract SubPool is
     function redeemableUnits(address investor) external view returns (uint256 total) {
         Allocation[] storage allocs = _allocations[investor];
         for (uint256 i = 0; i < allocs.length; i++) {
-            if (!allocs[i].redeemed && block.timestamp >= allocs[i].lockUpEndsAt) {
-                total += allocs[i].unitsIssued;
+            if (block.timestamp >= allocs[i].lockUpEndsAt) {
+                total += _remaining(allocs[i], investor, i);
             }
         }
     }
@@ -1065,8 +1439,8 @@ contract SubPool is
     function lockedUnits(address investor) external view returns (uint256 total) {
         Allocation[] storage allocs = _allocations[investor];
         for (uint256 i = 0; i < allocs.length; i++) {
-            if (!allocs[i].redeemed && block.timestamp < allocs[i].lockUpEndsAt) {
-                total += allocs[i].unitsIssued;
+            if (block.timestamp < allocs[i].lockUpEndsAt) {
+                total += _remaining(allocs[i], investor, i);
             }
         }
     }
@@ -1093,8 +1467,41 @@ contract SubPool is
     /**
      * @notice Get implementation version
      */
+    /**
+     * @notice A Series' Maximum Redemption Price per unit (4 dp, rounded down):
+     *         NAV₀ × (1 + NIR × tenor / 365 days), tenor = deployment to maturity.
+     */
+    function seriesMaxRedemptionPrice(uint256 seriesId) external view returns (uint256) {
+        return _seriesMaxRedemptionPrice(seriesId);
+    }
+
+    /**
+     * @notice What a Series allocation redeems at and is owed.
+     * @return mrp Maximum Redemption Price per unit
+     * @return maturityNav NAV_m (0 until fixed)
+     * @return price Redemption price per unit, min(mrp, maturityNav) (0 until fixed)
+     * @return remainingUnits Units not yet redeemed
+     * @return wlpDue WLP still owed for those units at `price` (0 until fixed)
+     */
+    function seriesRedemptionQuote(address investor, uint256 allocationIndex)
+        external
+        view
+        returns (uint256 mrp, uint256 maturityNav, uint256 price, uint256 remainingUnits, uint256 wlpDue)
+    {
+        if (allocationIndex >= _allocations[investor].length) revert AllocationIndexOutOfBounds();
+        Allocation storage alloc = _allocations[investor][allocationIndex];
+        if (alloc.investmentType != 1) revert NotSeriesAllocation();
+        mrp = _seriesMaxRedemptionPrice(alloc.seriesId);
+        maturityNav = seriesMaturityNav[alloc.seriesId];
+        remainingUnits = _remaining(alloc, investor, allocationIndex);
+        if (maturityNav != 0) {
+            price = mrp < maturityNav ? mrp : maturityNav;
+            wlpDue = _floor2((remainingUnits * price) / 1e18);
+        }
+    }
+
     function version() public pure virtual returns (string memory) {
-        return "1.5.0";
+        return "1.9.0";
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1102,38 +1509,97 @@ contract SubPool is
     // ═══════════════════════════════════════════════════════════════
 
     /**
-     * @dev Internal redeem logic shared by redeem() and redeemEarly()
+     * @dev Returns units still available to redeem on this allocation. `redeemed` is
+     *      checked FIRST as a terminal override — this matters for allocations that
+     *      were already fully redeemed under a pre-partial-redemption implementation:
+     *      they have `redeemed = true` but `unitsRedeemedOf` defaults to 0 for them,
+     *      so without this override `unitsIssued - unitsRedeemedOf[...]` would
+     *      incorrectly show them as fully redeemable again.
      */
-    function _redeem(address investor, uint256 allocationIndex, bool early) internal {
+    function _floor2(uint256 x) internal pure returns (uint256) {
+        return x - (x % CENT);
+    }
+
+    function _floor4(uint256 x) internal pure returns (uint256) {
+        return x - (x % NAV_STEP);
+    }
+
+    function _seriesMaxRedemptionPrice(uint256 seriesId) internal view returns (uint256) {
+        uint256 entryNav = seriesEntryNav[seriesId];
+        if (entryNav == 0) revert EntryNavNotSet(seriesId);
+        uint256 nirBps = seriesNirBps[seriesId];
+        if (nirBps == 0) revert SeriesNirNotSet(seriesId);
+        Series storage s = seriesRegistry[seriesId];
+        uint256 tenor = s.endDate - s.startDate;
+        return _floor4((entryNav * (BPS_YEAR + nirBps * tenor)) / BPS_YEAR);
+    }
+
+    /// @dev min(MRP, NAV_m); NAV_m must already be fixed.
+    function _seriesRedemptionPrice(uint256 seriesId) internal view returns (uint256) {
+        uint256 mrp = _seriesMaxRedemptionPrice(seriesId);
+        uint256 navM = seriesMaturityNav[seriesId];
+        return mrp < navM ? mrp : navM;
+    }
+
+    function _remaining(Allocation storage alloc, address investor, uint256 allocationIndex) internal view returns (uint256) {
+        return alloc.redeemed ? 0 : (alloc.unitsIssued - unitsRedeemedOf[investor][allocationIndex]);
+    }
+
+    /**
+     * @dev Internal redeem logic shared by redeem() and redeemEarly().
+     * @param amount Units to redeem; 0 means "redeem the full remaining balance".
+     */
+    function _redeem(address investor, uint256 allocationIndex, bool early, uint256 amount) internal {
         if (allocationIndex >= _allocations[investor].length) revert AllocationIndexOutOfBounds();
 
         Allocation storage alloc = _allocations[investor][allocationIndex];
-        if (alloc.redeemed) revert AllocationAlreadyRedeemed();
+        // A Series is redeemed only by the owner at min(MRP, NAV_m), via
+        // redeemSeries — never at the full NAV, and never early.
+        if (alloc.investmentType == 1) revert UseRedeemSeries();
+        uint256 remaining = _remaining(alloc, investor, allocationIndex);
+        if (remaining == 0) revert AllocationAlreadyRedeemed();
+
+        // 0 = the full remainder (always allowed — a pre-upgrade allocation's
+        // remainder can have more than 2 dp); a partial amount is whole cents.
+        if (amount != 0 && amount % CENT != 0) revert AmountPrecision(amount);
+        uint256 units = amount == 0 ? remaining : amount;
+        if (units > remaining) revert InsufficientRemainingUnits(remaining, units);
 
         // Check lock-up unless early redemption
         if (!early && block.timestamp < alloc.lockUpEndsAt) {
             revert LockUpNotExpired(alloc.lockUpEndsAt);
         }
 
-        uint256 units = alloc.unitsIssued;
-
         // Calculate WLP to return: wlpReturn = units * currentNav / 1e18
         uint256 wlpToReturn = (units * currentNav) / 1e18;
 
-        // Apply early exit penalty if applicable
-        if (early && earlyExitPenaltyBps > 0) {
+        // Apply early exit penalty only when the exit is genuinely early — i.e.
+        // the lock-up has NOT expired yet. Once matured, redeemEarly must behave
+        // like redeem (no penalty), so calling the "wrong" entrypoint after
+        // maturity can never cost the investor the penalty needlessly. This is
+        // re-evaluated fresh on every call, so an investor can redeemEarly() part
+        // of an allocation before maturity (penalty applies to that slice only)
+        // and redeem() the rest afterwards with no penalty.
+        if (early && block.timestamp < alloc.lockUpEndsAt && earlyExitPenaltyBps > 0) {
             uint256 penalty = (wlpToReturn * earlyExitPenaltyBps + 9999) / 10000;
             wlpToReturn -= penalty;
             // Penalty stays in the pool (benefits remaining investors via NAV)
         }
+
+        // Paid in whole cents, rounded down; the remainder stays in the pool.
+        wlpToReturn = _floor2(wlpToReturn);
 
         // Check sufficient liquidity
         if (totalWlpBalance < wlpToReturn) {
             revert InsufficientLiquidity(totalWlpBalance, wlpToReturn);
         }
 
-        // Mark allocation as redeemed
-        alloc.redeemed = true;
+        // Record redemption progress; only becomes terminal once fully drained.
+        uint256 newUnitsRedeemed = unitsRedeemedOf[investor][allocationIndex] + units;
+        unitsRedeemedOf[investor][allocationIndex] = newUnitsRedeemed;
+        if (newUnitsRedeemed >= alloc.unitsIssued) {
+            alloc.redeemed = true;
+        }
 
         // Burn units from investor (permanently cancelled on-chain)
         unitBalanceOf[investor] -= units;
@@ -1144,7 +1610,7 @@ contract SubPool is
 
         wlpToken.safeTransfer(investor, wlpToReturn);
 
-        emit Redeemed(investor, units, wlpToReturn, allocationIndex, early);
+        emit Redeemed(investor, units, wlpToReturn, allocationIndex, early, alloc.unitsIssued - newUnitsRedeemed);
     }
 
     /**
