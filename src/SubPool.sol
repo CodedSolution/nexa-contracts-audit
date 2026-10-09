@@ -184,6 +184,12 @@ contract SubPool is
     uint256 private constant CENT = 1e16;
     uint256 private constant NAV_STEP = 1e14;
     uint256 private constant BPS_YEAR = 10_000 * 365 days;
+    // Valid NAV per unit range, as enforced by updateNav.
+    uint256 private constant MIN_NAV = 1e15;
+    uint256 private constant MAX_NAV = 1000e18;
+    // A Series takes allocations from its start date for this long (activation
+    // plus retries of a failed allocation), and never at or after maturity.
+    uint256 public constant SERIES_ALLOCATION_WINDOW = 7 days;
 
     // ═══════════════════════════════════════════════════════════════
     //                           EVENTS
@@ -304,6 +310,9 @@ contract SubPool is
     error SeriesMaturityNavAlreadyFixed(uint256 seriesId);
     error EntryNavNotSet(uint256 seriesId);
     error LegacyTermsNotAllowed(uint256 seriesId);
+    error LegacyTermsRequired(uint256 seriesId);
+    error EntryNavAlreadySet(uint256 seriesId);
+    error SeriesAllocationClosed(uint256 seriesId, uint256 closesAt);
 
     // ═══════════════════════════════════════════════════════════════
     //                        CONSTRUCTOR
@@ -446,7 +455,17 @@ contract SubPool is
             // cannot take money before its Net Investor Rate is set.
             if (seriesNirBps[seriesId] == 0) revert SeriesNirNotSet(seriesId);
             if (block.timestamp < s.startDate) revert SeriesNotStarted(seriesId, s.startDate);
-            if (s.endDate > 0 && block.timestamp > s.endDate) revert SeriesEnded(seriesId, s.endDate);
+            if (s.endDate > 0 && block.timestamp >= s.endDate) revert SeriesEnded(seriesId, s.endDate);
+            // Units are issued at the Series' NAV₀, so new money may only come in
+            // around deployment — never later in the term at a stale NAV₀.
+            {
+                uint256 closesAt = s.startDate + SERIES_ALLOCATION_WINDOW;
+                if (s.endDate > 0 && s.endDate < closesAt) closesAt = s.endDate;
+                if (block.timestamp >= closesAt) revert SeriesAllocationClosed(seriesId, closesAt);
+            }
+            // NAV₀ is set once at deployment (setSeriesEntryNav) from the last NAV
+            // before the start date; every allocation uses it.
+            if (seriesEntryNav[seriesId] == 0) revert EntryNavNotSet(seriesId);
             if (s.minAllocation > 0 && wlpAmount < s.minAllocation) revert BelowMinimumAllocation(wlpAmount, s.minAllocation);
             if (s.maxSize > 0) {
                 // Write before check: revert unwinds the write atomically.
@@ -462,13 +481,7 @@ contract SubPool is
             }
             lockUpSeconds = s.lockUpSeconds;
             seriesEndDate = s.endDate;
-            // The first allocation fixes the Series' NAV₀; later ones (e.g. a
-            // retried allocation after a NAV push) are issued at the same NAV, so
-            // every investor in the Series shares one NAV₀ and one MRP.
-            if (seriesEntryNav[seriesId] == 0) {
-                seriesEntryNav[seriesId] = currentNav;
-                emit SeriesEntryNavSet(seriesId, currentNav);
-            }
+            // Every investor in the Series shares one NAV₀ and one MRP.
             issueNav = seriesEntryNav[seriesId];
         }
 
@@ -561,7 +574,7 @@ contract SubPool is
         if (newNav == 0) revert InvalidAmount();
         // Floor: 0.001e18 — prevents unit overflow on allocation.
         // Ceiling: 1000e18 — prevents redemptions returning near-zero WLP.
-        if (newNav < 1e15 || newNav > 1000e18) revert InvalidAmount();
+        if (newNav < MIN_NAV || newNav > MAX_NAV) revert InvalidAmount();
         // NAV per unit is published to exactly 4 decimal places.
         if (newNav % NAV_STEP != 0) revert NavPrecision(newNav);
 
@@ -1111,6 +1124,9 @@ contract SubPool is
         Series storage s = seriesRegistry[seriesId];
         if (s.lockUpSeconds == 0) revert SeriesNotFound(seriesId);
         if (seriesNirBps[seriesId] != 0) revert SeriesNirAlreadySet(seriesId);
+        // A Series allocated before the upgrade has no NAV₀ on-chain: it must be
+        // back-filled with adminSetSeriesLegacyTerms, which needs the NIR unset.
+        if (s.totalAllocated != 0 && seriesEntryNav[seriesId] == 0) revert LegacyTermsRequired(seriesId);
         if (nirBps == 0 || nirBps > 5000) revert InvalidBps();
         // The MRP is accrued from deployment (startDate) to maturity (endDate).
         if (s.endDate <= s.startDate) revert InvalidSeriesConfig();
@@ -1118,6 +1134,27 @@ contract SubPool is
 
         seriesNirBps[seriesId] = nirBps;
         emit SeriesNirSet(seriesId, nirBps);
+    }
+
+    /**
+     * @notice Fix a Series' NAV₀ at deployment: the last NAV per unit published
+     *         before its start date, from the off-chain NAV record. One-shot, and
+     *         only before the Series' first allocation.
+     * @param seriesId Series to set
+     * @param entryNav NAV₀ (4 dp, within the valid NAV range)
+     */
+    function setSeriesEntryNav(uint256 seriesId, uint256 entryNav) external onlyOwner {
+        Series storage s = seriesRegistry[seriesId];
+        if (s.lockUpSeconds == 0) revert SeriesNotFound(seriesId);
+        if (seriesNirBps[seriesId] == 0) revert SeriesNirNotSet(seriesId);
+        if (seriesEntryNav[seriesId] != 0) revert EntryNavAlreadySet(seriesId);
+        if (s.totalAllocated != 0) revert LegacyTermsRequired(seriesId);
+        if (block.timestamp < s.startDate) revert SeriesNotStarted(seriesId, s.startDate);
+        if (s.endDate > 0 && block.timestamp >= s.endDate) revert SeriesEnded(seriesId, s.endDate);
+        _checkNav(entryNav);
+
+        seriesEntryNav[seriesId] = entryNav;
+        emit SeriesEntryNavSet(seriesId, entryNav);
     }
 
     /**
@@ -1167,10 +1204,13 @@ contract SubPool is
         if (toRedeem > remaining) revert InsufficientRemainingUnits(remaining, toRedeem);
 
         uint256 price = _seriesRedemptionPrice(seriesId);
-        uint256 wlp = _floor2((toRedeem * price) / 1e18);
+        uint256 redeemedBefore = unitsRedeemedOf[investor][allocationIndex];
+        uint256 newUnitsRedeemed = redeemedBefore + toRedeem;
+        // Paid as the change in the cumulative rounded entitlement, so paying in
+        // instalments never pays less in total than paying in one go.
+        uint256 wlp = _floor2((newUnitsRedeemed * price) / 1e18) - _floor2((redeemedBefore * price) / 1e18);
         if (totalWlpBalance < wlp) revert InsufficientLiquidity(totalWlpBalance, wlp);
 
-        uint256 newUnitsRedeemed = unitsRedeemedOf[investor][allocationIndex] + toRedeem;
         unitsRedeemedOf[investor][allocationIndex] = newUnitsRedeemed;
         if (newUnitsRedeemed >= alloc.unitsIssued) {
             alloc.redeemed = true;
@@ -1214,9 +1254,9 @@ contract SubPool is
         }
         if (nirBps == 0 || nirBps > 5000) revert InvalidBps();
         if (s.endDate <= s.startDate) revert InvalidSeriesConfig();
-        if (entryNav == 0 || entryNav % NAV_STEP != 0) revert NavPrecision(entryNav);
+        _checkNav(entryNav);
         if (maturityNav != 0) {
-            if (maturityNav % NAV_STEP != 0) revert NavPrecision(maturityNav);
+            _checkNav(maturityNav);
             if (block.timestamp < s.endDate) revert SeriesNotMatured(seriesId, s.endDate);
         }
 
@@ -1496,12 +1536,19 @@ contract SubPool is
         remainingUnits = _remaining(alloc, investor, allocationIndex);
         if (maturityNav != 0) {
             price = mrp < maturityNav ? mrp : maturityNav;
-            wlpDue = _floor2((remainingUnits * price) / 1e18);
+            uint256 redeemedSoFar = alloc.unitsIssued - remainingUnits;
+            wlpDue = _floor2((alloc.unitsIssued * price) / 1e18) - _floor2((redeemedSoFar * price) / 1e18);
         }
     }
 
     function version() public pure virtual returns (string memory) {
         return "1.9.0";
+    }
+
+    /// @notice The last reinitializer that ran (5 once migrateV5 has run), so an
+    ///         upgrade can skip a migration that was already applied.
+    function initializedVersion() external view returns (uint64) {
+        return _getInitializedVersion();
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1518,6 +1565,12 @@ contract SubPool is
      */
     function _floor2(uint256 x) internal pure returns (uint256) {
         return x - (x % CENT);
+    }
+
+    /// @dev A NAV per unit must be within the valid range and exactly 4 dp.
+    function _checkNav(uint256 nav) internal pure {
+        if (nav < MIN_NAV || nav > MAX_NAV) revert InvalidAmount();
+        if (nav % NAV_STEP != 0) revert NavPrecision(nav);
     }
 
     function _floor4(uint256 x) internal pure returns (uint256) {

@@ -80,14 +80,22 @@ Reviewers should assess the **interactions**, not just each contract in isolatio
     window (start/end), max size, and minimum allocation. A Series has a **Net
     Investor Rate** (`seriesNirBps`, its *maximum* return, set once when its
     window opens — this freezes its terms) and a single issue NAV (`seriesEntryNav`,
-    fixed by its first allocation). Its **Maximum Redemption Price** is
+    NAV₀: set once by the owner at deployment with `setSeriesEntryNav`, from the
+    last NAV published before the start date; every allocation is issued at it).
+    A Series takes allocations only from its start date for
+    `SERIES_ALLOCATION_WINDOW` (7 days, for retries) and never at or after
+    maturity, so no money can enter later in the term at a stale NAV₀. Its
+    **Maximum Redemption Price** is
     `MRP = floor4(NAV₀ · (1 + NIR · (endDate − startDate) / 365 days))`.
     There is **no Reserve Fund and no top-up** (v1.9.0): at maturity the owner
     fixes `seriesMaturityNav` (only after that day's NAV push) and redeems each
     allocation with `redeemSeries` at **`min(MRP, NAV_m)`**, in full or in
-    instalments. Above the MRP the surplus stays in the pool (Participatory
-    holders); below it the Series investor bears the shortfall. Investors cannot
-    call `redeem`/`redeemEarly` on a Series allocation.
+    instalments. Each instalment pays the change in the cumulative rounded
+    entitlement, `floor2(redeemedAfter · price) − floor2(redeemedBefore · price)`,
+    so splitting a payment never pays less than paying it at once. Above the MRP
+    the surplus stays in the pool (Participatory holders); below it the Series
+    investor bears the shortfall. Investors cannot call `redeem`/`redeemEarly` on
+    a Series allocation.
 - **NAV appreciation = yield.** The backend pushes NAV daily (oracle). Financing
   profit and injected interest income (`receiveInterest`) raise pool value without
   minting new units, so NAV rises and existing holders capture the return.
@@ -175,7 +183,10 @@ across upgrades**:
   and `seriesMaturityNav` (top-level mappings, slots 479–481) after
   `unitsRedeemedOf`, shrinking `__gap` 45 → 42; the `Allocation` and `Series`
   structs are unchanged. `migrateV5` (`reinitializer(5)`) is emit-only; Series
-  allocated before the upgrade are back-filled once via `adminSetSeriesLegacyTerms`.
+  allocated before the upgrade are back-filled once via `adminSetSeriesLegacyTerms`
+  (`setSeriesNir` refuses such a Series so the back-fill can't be blocked; all
+  NAV inputs are range-checked like `updateNav`). `initializedVersion()` exposes
+  the last reinitializer that ran.
 - Confirm each contract's initializer cannot be re-invoked and that
   `_disableInitializers()` is set in constructors.
 
@@ -225,18 +236,19 @@ via_ir = true
 nexa_contracts_audit/
 ├── README.md
 └── src/
-    ├── SubPool.sol                 # audit target (1650 LOC)
+    ├── SubPool.sol                 # audit target (1703 LOC)
     ├── WLP.sol                     # audit target (223 LOC)
-    ├── WTKN.sol                    # audit target (344 LOC)
-    ├── ROR_ERC1155_V2.sol          # audit target (482 LOC)
+    ├── WTKN.sol                    # audit target (372 LOC)
+    ├── ROR_ERC1155_V2.sol          # audit target (583 LOC)
     ├── ROR_ERC1155_Storage.sol     # dependency (149 LOC)
     ├── interfaces/
-    │   └── IROR_ERC1155.sol        # dependency (234 LOC)
+    │   ├── IROR_ERC1155.sol        # dependency (242 LOC)
+    │   └── ISubPool.sol            # reference only, generated from SubPool's ABI (not imported)
     └── libraries/
         └── RORPermissions.sol      # dependency (24 LOC)
 ```
 
-Total in-scope: **~2,400 LOC** across 7 files (4 targets + 3 dependencies).
+Total in-scope: **~3,300 LOC** across 7 files (4 targets + 3 dependencies).
 
 ---
 
@@ -245,6 +257,10 @@ Total in-scope: **~2,400 LOC** across 7 files (4 targets + 3 dependencies).
 2. **Series redemption at min(MRP, NAV_m)** — MRP math and rounding, the one-time
    NAV_m fix (stale-NAV guard), instalment (`redeemSeries` partial) accounting,
    the legacy back-fill, and that no path pays a Series more than min(MRP, NAV_m).
+   Trust assumption: `fixSeriesMaturityNav` fixes whatever NAV is live once a NAV
+   has been pushed at/after maturity; the owner (backend) calls it only while the
+   first such NAV is still the live one, and otherwise waits for an admin decision.
+   Likewise NAV₀ (`setSeriesEntryNav`) is owner-supplied, as every NAV is.
 3. **NAV & unit accounting** — allocate/redeem math, rounding, early-exit penalty,
    `totalWlpBalance` vs actual token balance drift.
 4. **Financing & settlement** — utilisation cap, default write-offs, ROR faceValue
