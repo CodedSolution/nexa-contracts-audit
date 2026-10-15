@@ -8,6 +8,8 @@ import "./ROR_ERC1155_Storage.sol";
  * @notice ERC1155 multi-tier deep supply chain financing token with UUPS upgradeability
  * @dev Minimal on-chain state — all metadata emitted via events.
  *      Keeps only execution guards: tier, hasFinanced, status, WTKN stakes.
+ *      2.1.0: one ROR unit = one sen (RM0.01). Tokens minted by an earlier
+ *      implementation keep one unit = RM1; weiPerUnit(tokenId) tells them apart.
  */
 contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
 
@@ -78,6 +80,11 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         if (supplier == address(0) || anchorBuyer == address(0)) revert IROR_ERC1155.InvalidAddress();
         if (supplier == anchorBuyer) revert IROR_ERC1155.SupplierIsBuyer();
         if (invoiceAmount == 0) revert IROR_ERC1155.InvalidAmount();
+        // 1 ROR unit = 1 sen. A sub-sen amount is refused rather than floored, so
+        // units x SEN_WEI_PER_UNIT always equals the stake and every holder's
+        // release at maturity is exact.
+        if (invoiceAmount < SEN_WEI_PER_UNIT) revert IROR_ERC1155.InvoiceAmountTooSmall();
+        if (invoiceAmount % SEN_WEI_PER_UNIT != 0) revert IROR_ERC1155.InvoiceAmountNotWholeSen();
         if (dueDate <= block.timestamp) revert IROR_ERC1155.InvalidDueDate();
         if (bytes(invoiceNumber).length == 0) revert IROR_ERC1155.EmptyInvoiceNumber();
 
@@ -90,7 +97,19 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         IWTKN wtknToken = IWTKN(wtknContract);
         if (wtknToken.balanceOf(anchorBuyer) < invoiceAmount) revert IROR_ERC1155.InsufficientWTKNBal();
         if (wtknToken.allowance(anchorBuyer, address(this)) < invoiceAmount) revert IROR_ERC1155.InsufficientWTKNAllow();
-        wtknToken.transferFrom(anchorBuyer, address(this), invoiceAmount);
+        // Interaction — must succeed, otherwise revert the whole call.
+        // Pulling from `anchorBuyer` rather than msg.sender is the intended
+        // design: the platform mints an ROR against the buyer's own staked
+        // collateral, so the caller is never the token owner. The buyer must
+        // have granted this contract an allowance, and both the balance and
+        // allowance are checked immediately above. The call is reachable only
+        // through MINTER_ROLE, so the control that matters is custody of that
+        // role's key, not the shape of this transfer. Reviewed and accepted;
+        // see the security assessment's accepted-risk register.
+        // slither-disable-next-line arbitrary-send-erc20
+        if (!wtknToken.transferFrom(anchorBuyer, address(this), invoiceAmount)) {
+            revert IROR_ERC1155.WTKNTransferFailed();
+        }
         wtknToken.recordStake(tokenId, invoiceAmount);
 
         // Store WTKN stake (minimal)
@@ -102,13 +121,13 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         // Store token state (minimal)
         tokenState[tokenId].status = IROR_ERC1155.RoRStatus.CREATED;
         tokenState[tokenId].nextFinancingId = 1;
+        tokenState[tokenId].weiPerUnit = SEN_WEI_PER_UNIT;
 
         // Store supplier state (minimal)
         supplierState[tokenId][supplier].tier = 1;
 
-        // Mint ERC1155 tokens (1 ROR token per whole WTKN; sub-unit invoices are rejected)
-        if (invoiceAmount < 10**18) revert IROR_ERC1155.InvoiceAmountTooSmall();
-        uint256 rorAmount = invoiceAmount / 10**18;
+        // Mint ERC1155 tokens (1 ROR unit per sen; whole sen checked above)
+        uint256 rorAmount = invoiceAmount / SEN_WEI_PER_UNIT;
         _mint(supplier, tokenId, rorAmount, "");
 
         // Events carry all metadata
@@ -207,8 +226,10 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
             }
         }
 
-        // Calculate advance — only AT_FINANCING fees reduce advance
-        uint256 amountInWei = supplierBalance * 10**18;
+        // Calculate advance — only AT_FINANCING fees reduce advance. Units are
+        // converted at the token's own scale (sen, or whole ringgit for a token
+        // minted before 2.1.0).
+        uint256 amountInWei = supplierBalance * _weiPerUnit(tokenId);
         uint256 totalFeeAmount = totalAtFinancingFees + totalDeferredFees;
         if (totalAtFinancingFees >= amountInWei) revert IROR_ERC1155.TotalFeeExceedsBalance();
 
@@ -257,20 +278,26 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
             }
         }
 
-        address[] memory allHolders = _holders[tokenId];
+        // Read the holder count only — do NOT copy the whole _holders array into
+        // memory. A full copy is O(total holders) per call regardless of batchSize,
+        // which lets a bloated holder set (dust fan-out) push this call over the
+        // block gas limit and permanently freeze WTKN release. Indexing storage
+        // directly inside the batch window keeps the cost O(batchSize). Safe because
+        // ROR transfers are blocked post-maturity, so _holders cannot change here.
+        uint256 holderCount = _holders[tokenId].length;
         uint256 supply = totalSupply(tokenId);
         if (supply == 0) revert IROR_ERC1155.InvalidAmount();
 
-        uint256 endIndex = batchSize == 0 ? allHolders.length : startIndex + batchSize;
-        if (endIndex > allHolders.length) endIndex = allHolders.length;
-        if (startIndex >= allHolders.length) return (0, 0);
+        uint256 endIndex = batchSize == 0 ? holderCount : startIndex + batchSize;
+        if (endIndex > holderCount) endIndex = holderCount;
+        if (startIndex >= holderCount) return (0, 0);
 
         IWTKN wtknToken = IWTKN(stake.wtknContract);
         successCount = 0;
         totalAmount = 0;
 
         for (uint256 i = startIndex; i < endIndex; i++) {
-            address holder = allHolders[i];
+            address holder = _holders[tokenId][i];
             uint256 rorBalance = balanceOf(holder, tokenId);
 
             if (rorBalance == 0 || stake.releasedAmounts[holder] > 0) continue;
@@ -304,8 +331,7 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         }
 
         if (stake.totalReleased >= stake.amount && !stake.isReleased) {
-            stake.isReleased = true;
-            IWTKN(stake.wtknContract).recordUnstake(tokenId, stake.amount);
+            _finalizeStakeRelease(tokenId, stake);
         }
 
         emit IROR_ERC1155.WTKNBatchReleased(tokenId, successCount, totalAmount);
@@ -331,6 +357,12 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         if (pending == 0) revert IROR_ERC1155.NoPendingRelease(tokenId, holder);
 
         WTKNStake storage stake = wtknStakes[tokenId];
+        // Defense-in-depth: once the stake is fully settled (e.g. a zero-supply
+        // burn already refunded the unreleased balance to the buyer), the parked
+        // claim is no longer backed by this receivable's collateral. Paying it
+        // now would draw from another receivable's WTKN. The burn gate already
+        // prevents this, but refuse here too so no path can over-release.
+        if (stake.isReleased) revert IROR_ERC1155.WTKNAlreadyReleased();
         IWTKN wtknToken = IWTKN(stake.wtknContract);
 
         _pendingWTKNRelease[tokenId][holder] = 0;
@@ -342,7 +374,9 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
 
         if (transferred) {
             stake.totalReleased += pending;
-            if (stake.totalReleased >= stake.amount) stake.isReleased = true;
+            // isReleased is false here (checked above). Before 2.1.0 the retry
+            // set it without recordUnstake, leaving WTKN.totalStaked inflated.
+            if (stake.totalReleased >= stake.amount) _finalizeStakeRelease(tokenId, stake);
             emit IROR_ERC1155.WTKNReleased(tokenId, holder, pending);
         } else {
             // Still failing — put back in pending queue and re-emit for monitoring.
@@ -392,8 +426,7 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
 
         // Finalize settlement if this was the last outstanding release.
         if (stake.totalReleased >= stake.amount && !stake.isReleased) {
-            stake.isReleased = true;
-            IWTKN(stake.wtknContract).recordUnstake(tokenId, stake.amount);
+            _finalizeStakeRelease(tokenId, stake);
         }
     }
 
@@ -416,10 +449,21 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
             // released. A burn in the post-due-date, pre-release window would
             // otherwise redistribute the buyer's collateral to the remaining
             // holders, or strand it entirely if it empties the supply.
+            //
+            // A parked (failed) release sets releasedAmounts BEFORE the transfer
+            // and leaves the amount in _pendingWTKNRelease without crediting
+            // totalReleased. So releasedAmounts != 0 alone does NOT mean the
+            // holder was actually paid. Also block while a pending release
+            // exists: otherwise the zero-supply branch below would refund the
+            // still-owed amount to the buyer while the retry queue can later pay
+            // the holder again from another receivable's collateral.
             bool matured =
                 (stake.expiryDate > 0 && block.timestamp >= stake.expiryDate) ||
                 stake.maturityReached;
-            if (matured && stake.releasedAmounts[msg.sender] == 0) continue;
+            if (
+                matured &&
+                (stake.releasedAmounts[msg.sender] == 0 || _pendingWTKNRelease[tokenId][msg.sender] > 0)
+            ) continue;
 
             _burn(msg.sender, tokenId, balance);
 
@@ -429,15 +473,17 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
                 // date now that (A) blocks the post-due-date window), return the
                 // unreleased WTKN to the anchor buyer instead of sealing it in
                 // this contract forever.
+                //
+                // The WHOLE stake is recorded as unstaked here, not only the
+                // remainder: before 2.1.0 only the remainder was recorded, which
+                // left WTKN.totalStaked inflated by everything already released.
                 if (stake.amount > 0 && !stake.isReleased) {
                     uint256 remaining = stake.amount - stake.totalReleased;
+                    stake.totalReleased = stake.amount;
+                    _finalizeStakeRelease(tokenId, stake);
                     if (remaining > 0) {
                         IWTKN wtkn = IWTKN(stake.wtknContract);
-                        address buyer = wtkn.anchorBuyer();
-                        stake.totalReleased = stake.amount;
-                        stake.isReleased = true;
-                        wtkn.recordUnstake(tokenId, remaining);
-                        if (!wtkn.transfer(buyer, remaining)) {
+                        if (!wtkn.transfer(wtkn.anchorBuyer(), remaining)) {
                             revert IROR_ERC1155.WTKNTransferFailed();
                         }
                     }
@@ -458,6 +504,12 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
     ) external onlyRole(CRONJOB_ROLE) nonReentrant {
         if (tokenId < MIN_TOKEN_ID || tokenId >= _tokenIdCounter) revert IROR_ERC1155.InvalidTokenId();
         if (financingId == 0) revert IROR_ERC1155.FinancingNotFound();
+
+        // Idempotent: a retried/duplicate settle (e.g. a job-queue re-submission)
+        // must not emit a second FeesSettled receipt, which off-chain reconciliation
+        // could double-count. One settlement per financing, enforced on-chain.
+        if (feesSettled[tokenId][financingId]) revert IROR_ERC1155.AlreadySettledFees();
+        feesSettled[tokenId][financingId] = true;
 
         emit IROR_ERC1155.FeesSettled(tokenId, financingId, block.timestamp);
     }
@@ -499,6 +551,46 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
             holders[i] = allHolders[i];
             balances[i] = balanceOf(allHolders[i], tokenId);
         }
+    }
+
+    /**
+     * @notice Wei of WTKN stake per ROR unit: 1e16 (1 unit = 1 sen) for a token
+     *         minted from 2.1.0, 1e18 (1 unit = RM1) for one minted earlier.
+     *         Reverts with TokenDoesNotExist for a token that isn't minted.
+     */
+    function weiPerUnit(uint256 tokenId) external view returns (uint256) {
+        return _weiPerUnit(tokenId);
+    }
+
+    /// @notice A release parked by a failed WTKN transfer, awaiting retryWTKNRelease.
+    function getPendingRelease(uint256 tokenId, address holder) external view returns (uint256) {
+        return _pendingWTKNRelease[tokenId][holder];
+    }
+
+    function version() external pure returns (string memory) {
+        return "2.1.0";
+    }
+
+    // ============ Internal Helpers ============
+
+    function _weiPerUnit(uint256 tokenId) internal view returns (uint256) {
+        // stake.amount is set at mint and never cleared, so it marks a minted token.
+        if (wtknStakes[tokenId].amount == 0) revert IROR_ERC1155.TokenDoesNotExist();
+        uint256 stored = tokenState[tokenId].weiPerUnit;
+        return stored == 0 ? LEGACY_WEI_PER_UNIT : stored;
+    }
+
+    /**
+     * @dev Marks the stake released and records the WHOLE stake as unstaked on
+     *      WTKN. Every path that sets isReleased comes through here, and only
+     *      while it is still false, so a token's stake is recorded exactly once.
+     *      For a token minted before 2.1.0 and finished after an upgrade this is
+     *      also safe: the old code only ever recorded an unstake while setting
+     *      isReleased, so isReleased == false means nothing was recorded yet.
+     */
+    function _finalizeStakeRelease(uint256 tokenId, WTKNStake storage stake) internal {
+        stake.isReleased = true;
+        IWTKN(stake.wtknContract).recordUnstake(tokenId, stake.amount);
     }
 
     // ============ Hooks and Overrides ============

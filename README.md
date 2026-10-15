@@ -20,7 +20,7 @@ mediates buyer-side settlement flows.
 | **SubPool** | `src/SubPool.sol` | 1.9.0 | — | UUPS · Ownable · Pausable · ReentrancyGuard · ERC1155Holder | Per-buyer investor liquidity pool: allocate/redeem, NAV oracle, supplier financing, settlement, fees, **investor allowlist** |
 | **WLP** | `src/WLP.sol` | 1.1.0 | ERC-20 | UUPS · Ownable · Pausable | Working Liquidity Pool token; owner-minted, fiat-backed |
 | **WTKN** | `src/WTKN.sol` | 2.0.0 | ERC-20 | UUPS · Ownable · Pausable | Per-anchor-buyer wrapped token with blacklist + transfer restrictions |
-| **ROR (V2)** | `src/ROR_ERC1155_V2.sol` | V2 | ERC-1155 | UUPS · AccessControl | Multi-tier receivable/invoice tokens with maturity + settlement lifecycle |
+| **ROR (V2)** | `src/ROR_ERC1155_V2.sol` | 2.1.0 | ERC-1155 | UUPS · AccessControl | Multi-tier receivable/invoice tokens with maturity + settlement lifecycle |
 
 ### In scope — supporting files (dependencies of the above; not standalone)
 
@@ -80,7 +80,12 @@ Reviewers should assess the **interactions**, not just each contract in isolatio
     window (start/end), max size, and minimum allocation. A Series has a **Net
     Investor Rate** (`seriesNirBps`, its *maximum* return, set once when its
     window opens — this freezes its terms) and a single issue NAV (`seriesEntryNav`,
-    fixed by its first allocation). Its **Maximum Redemption Price** is
+    NAV₀), set once by the owner with `setSeriesEntryNav` before the first
+    allocation: the last NAV published before the Series' start date. Allocations
+    revert until it is set, and are only accepted for `SERIES_ALLOCATION_WINDOW`
+    (7 days) from the start date, never at or after `endDate`. Instalment
+    redemptions are priced as the difference of cumulative floors, so instalments
+    sum to exactly what a single full redemption would pay. Its **Maximum Redemption Price** is
     `MRP = floor4(NAV₀ · (1 + NIR · (endDate − startDate) / 365 days))`.
     There is **no Reserve Fund and no top-up** (v1.9.0): at maturity the owner
     fixes `seriesMaturityNav` (only after that day's NAV push) and redeems each
@@ -133,7 +138,12 @@ Per-anchor-buyer wrapped ERC-20. The buyer **stakes WTKN to originate an ROR**
 **blacklist** — so WTKN cannot circulate freely and is confined to settlement flows.
 
 ### ROR V2 — the receivable, multi-tier
-ERC-1155 invoice token minted 1:1 against staked WTKN with a `dueDate`. Models a
+ERC-1155 invoice token minted against staked WTKN with a `dueDate`. From **2.1.0**
+one ROR unit is one **sen** (RM0.01, `1e16` wei of WTKN): an invoice of RM35,000.45
+stakes 35,000.45 WTKN and mints 3,500,045 units. `mintROR` rejects an amount that is
+not a whole number of sen (`InvoiceAmountNotWholeSen`) or below one sen
+(`InvoiceAmountTooSmall`). Tokens minted by an earlier implementation keep one unit
+= RM1 (`1e18` wei); `weiPerUnit(tokenId)` returns each token's scale. Models a
 **deep supply chain**: the originating supplier holds **tier 1**, and each onward
 transfer down the chain assigns **tier + 1** (forward-only — backwards and
 cross-tier-skip transfers are rejected). Transfers are blocked at/after maturity. On
@@ -176,6 +186,26 @@ across upgrades**:
   `unitsRedeemedOf`, shrinking `__gap` 45 → 42; the `Allocation` and `Series`
   structs are unchanged. `migrateV5` (`reinitializer(5)`) is emit-only; Series
   allocated before the upgrade are back-filled once via `adminSetSeriesLegacyTerms`.
+- **ROR V2 → 2.1.0** (this release): appends `weiPerUnit` as the **last member of
+  the `TokenState` struct**, which is only ever stored as the value of the
+  `tokenState` mapping (never in an array, never copied whole). The new member takes
+  the struct's third slot, which no earlier implementation wrote, so it reads `0`
+  for tokens minted before the upgrade; `_weiPerUnit` maps `0` to the legacy `1e18`.
+  Top-level layout and `__gap` are unchanged by 2.1.0. Compared with the ROR in the
+  previous audit package, this source also carries the earlier fixes already on the
+  development branch: the `feesSettled` idempotency mapping appended after
+  `wtknStakes` (`__gap` 42 → 41), the checked `wtknToken.transferFrom` in `mintROR`,
+  and paginated release reading `_holders` from storage rather than copying it. Please verify this claim, and
+  that every units↔wei conversion uses the token's own scale. The only such
+  conversion is the at-financing fee cap in `financeMyRORBalance`; WTKN release at
+  maturity is pro-rata on `stake.amount` and so does not depend on the scale.
+- **ROR V2 → 2.1.0, unstake accounting:** every path that finishes a stake
+  (paginated release, `retryWTKNRelease`, `redirectPendingRelease`, `burnRORBatch`)
+  now goes through `_finalizeStakeRelease`, which records the **whole** stake as
+  unstaked on WTKN exactly once. Previously some paths recorded only the remainder
+  or nothing, leaving `WTKN.totalStaked` inflated. Please check this cannot double
+  count for a token part-way through settlement when its proxy is upgraded, and
+  whether `WTKN.recordUnstake` can revert and so block settlement.
 - Confirm each contract's initializer cannot be re-invoked and that
   `_disableInitializers()` is set in constructors.
 
@@ -225,30 +255,36 @@ via_ir = true
 nexa_contracts_audit/
 ├── README.md
 └── src/
-    ├── SubPool.sol                 # audit target (1650 LOC)
+    ├── SubPool.sol                 # audit target (1703 LOC)
     ├── WLP.sol                     # audit target (223 LOC)
-    ├── WTKN.sol                    # audit target (344 LOC)
-    ├── ROR_ERC1155_V2.sol          # audit target (482 LOC)
-    ├── ROR_ERC1155_Storage.sol     # dependency (149 LOC)
+    ├── WTKN.sol                    # audit target (372 LOC)
+    ├── ROR_ERC1155_V2.sol          # audit target (675 LOC)
+    ├── ROR_ERC1155_Storage.sol     # dependency (165 LOC)
     ├── interfaces/
-    │   └── IROR_ERC1155.sol        # dependency (234 LOC)
+    │   ├── IROR_ERC1155.sol        # dependency (248 LOC)
+    │   └── ISubPool.sol            # SubPool interface, generated from its ABI (340 LOC)
     └── libraries/
         └── RORPermissions.sol      # dependency (24 LOC)
 ```
 
-Total in-scope: **~2,400 LOC** across 7 files (4 targets + 3 dependencies).
+Total in-scope: **~3,400 LOC** across 7 files (4 targets + 3 dependencies), plus `ISubPool.sol`.
 
 ---
 
 ## Suggested focus areas
-1. **Storage-layout compatibility** on the SubPool upgrades (see above), incl. v1.9.0.
-2. **Series redemption at min(MRP, NAV_m)** — MRP math and rounding, the one-time
+1. **Storage-layout compatibility** on the SubPool upgrades (see above), incl. v1.9.0,
+   and on ROR 2.1.0 (the `TokenState.weiPerUnit` append).
+2. **ROR sen units (2.1.0)** — whole-sen mint checks, the per-token scale
+   (`weiPerUnit`, legacy `0` → `1e18`), the at-financing fee cap at both scales,
+   rounding of the pro-rata WTKN release with sen units (including after a burn
+   before maturity), and the single `recordUnstake` per stake.
+3. **Series redemption at min(MRP, NAV_m)** — MRP math and rounding, the one-time
    NAV_m fix (stale-NAV guard), instalment (`redeemSeries` partial) accounting,
    the legacy back-fill, and that no path pays a Series more than min(MRP, NAV_m).
-3. **NAV & unit accounting** — allocate/redeem math, rounding, early-exit penalty,
+4. **NAV & unit accounting** — allocate/redeem math, rounding, early-exit penalty,
    `totalWlpBalance` vs actual token balance drift.
-4. **Financing & settlement** — utilisation cap, default write-offs, ROR faceValue
+5. **Financing & settlement** — utilisation cap, default write-offs, ROR faceValue
    vs deployed WLP, re-entrancy on external token calls (CEI ordering).
-5. **Access control & upgrade authorization** across all four contracts.
-5. **WTKN transfer restrictions & blacklist** — can they wedge settlement or trap funds?
-6. **Investor allowlist** — the on-chain gate vs. the off-chain (operator) trust model.
+6. **Access control & upgrade authorization** across all four contracts.
+7. **WTKN transfer restrictions & blacklist** — can they wedge settlement or trap funds?
+8. **Investor allowlist** — the on-chain gate vs. the off-chain (operator) trust model.

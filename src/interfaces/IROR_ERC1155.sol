@@ -187,6 +187,7 @@ interface IROR_ERC1155 {
     error EmptyFeesArray();
     error AlreadySettledFees();
     error InvoiceAmountTooSmall();
+    error InvoiceAmountNotWholeSen();
 
     // ============ Core Functions ============
 
@@ -239,4 +240,9 @@ interface IROR_ERC1155 {
 
     function getHolders(uint256 tokenId)
         external view returns (address[] memory holders, uint256[] memory balances);
+
+    // Added in 2.1.0; proxies still on an earlier implementation don't have them.
+    function weiPerUnit(uint256 tokenId) external view returns (uint256);
+    function getPendingRelease(uint256 tokenId, address holder) external view returns (uint256);
+    function version() external pure returns (string memory);
 }
