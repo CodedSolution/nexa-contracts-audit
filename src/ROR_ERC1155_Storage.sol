@@ -43,6 +43,11 @@ abstract contract ROR_ERC1155_Storage is
 
     // ============ Constants ============
     uint256 internal constant MIN_TOKEN_ID = 1000;
+    // Wei of WTKN stake per ROR unit. From 2.1.0 a unit is one sen (RM0.01).
+    // Tokens minted by an earlier implementation counted whole ringgit and have
+    // no stored scale, so they read the legacy value (see _weiPerUnit).
+    uint256 internal constant SEN_WEI_PER_UNIT = 10**16;
+    uint256 internal constant LEGACY_WEI_PER_UNIT = 10**18;
 
     // ============ Structs (minimal execution guards) ============
 
@@ -50,6 +55,10 @@ abstract contract ROR_ERC1155_Storage is
         IROR_ERC1155.RoRStatus status;
         bool isSettled;
         uint256 nextFinancingId;
+        // Appended in 2.1.0. It takes the struct's third slot, which nothing used
+        // before, so it reads 0 for tokens minted earlier (0 = legacy, 1e18).
+        // Must stay the LAST member: append-only, like the top-level layout.
+        uint256 weiPerUnit;
     }
 
     struct SupplierState {
@@ -88,8 +97,15 @@ abstract contract ROR_ERC1155_Storage is
     // Non-zero means releasedAmounts[holder] is already set (main loop skips them).
     mapping(uint256 => mapping(address => uint256)) internal _pendingWTKNRelease;
 
+    // Idempotency guard for settleFees: true once fees for a (tokenId, financingId)
+    // have been settled, so a retried/duplicate call reverts instead of emitting a
+    // second FeesSettled receipt. Appended at the end (consuming one __gap slot) to
+    // preserve the UUPS storage layout. Defaults false for pre-upgrade financings.
+    mapping(uint256 => mapping(uint256 => bool)) public feesSettled;
+
     // ============ Storage Gap ============
-    uint256[42] private __gap;
+    // Reduced 42 -> 41 for the feesSettled mapping above; total reserved slots constant.
+    uint256[41] private __gap;
 
     // ============ Internal Helpers ============
 
