@@ -80,7 +80,12 @@ Reviewers should assess the **interactions**, not just each contract in isolatio
     window (start/end), max size, and minimum allocation. A Series has a **Net
     Investor Rate** (`seriesNirBps`, its *maximum* return, set once when its
     window opens — this freezes its terms) and a single issue NAV (`seriesEntryNav`,
-    fixed by its first allocation). Its **Maximum Redemption Price** is
+    NAV₀), set once by the owner with `setSeriesEntryNav` before the first
+    allocation: the last NAV published before the Series' start date. Allocations
+    revert until it is set, and are only accepted for `SERIES_ALLOCATION_WINDOW`
+    (7 days) from the start date, never at or after `endDate`. Instalment
+    redemptions are priced as the difference of cumulative floors, so instalments
+    sum to exactly what a single full redemption would pay. Its **Maximum Redemption Price** is
     `MRP = floor4(NAV₀ · (1 + NIR · (endDate − startDate) / 365 days))`.
     There is **no Reserve Fund and no top-up** (v1.9.0): at maturity the owner
     fixes `seriesMaturityNav` (only after that day's NAV push) and redeems each
@@ -250,19 +255,19 @@ via_ir = true
 nexa_contracts_audit/
 ├── README.md
 └── src/
-    ├── SubPool.sol                 # audit target (1650 LOC)
+    ├── SubPool.sol                 # audit target (1703 LOC)
     ├── WLP.sol                     # audit target (223 LOC)
     ├── WTKN.sol                    # audit target (372 LOC)
     ├── ROR_ERC1155_V2.sol          # audit target (675 LOC)
     ├── ROR_ERC1155_Storage.sol     # dependency (165 LOC)
     ├── interfaces/
     │   ├── IROR_ERC1155.sol        # dependency (248 LOC)
-    │   └── ISubPool.sol            # SubPool interface (88 LOC)
+    │   └── ISubPool.sol            # SubPool interface, generated from its ABI (340 LOC)
     └── libraries/
         └── RORPermissions.sol      # dependency (24 LOC)
 ```
 
-Total in-scope: **~3,350 LOC** across 7 files (4 targets + 3 dependencies), plus `ISubPool.sol`.
+Total in-scope: **~3,400 LOC** across 7 files (4 targets + 3 dependencies), plus `ISubPool.sol`.
 
 ---
 
