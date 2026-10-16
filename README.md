@@ -206,6 +206,14 @@ across upgrades**:
   or nothing, leaving `WTKN.totalStaked` inflated. Please check this cannot double
   count for a token part-way through settlement when its proxy is upgraded, and
   whether `WTKN.recordUnstake` can revert and so block settlement.
+- **Fixes for the CertiK AI scan (2026-10-15), still SubPool 1.9.0 / ROR 2.1.0.**
+  Both append only and need no back-fill (new values read `0`):
+  - ROR: `_settlementSupply` and `_settledUnits` (top-level mappings) after
+    `feesSettled`, shrinking `__gap` 41 → 39.
+  - SubPool: `navStale`, `maxNavAge` and `totalFeesReserved` after
+    `seriesMaturityNav`, shrinking `__gap` 42 → 39. `migrateV5` stays the latest
+    migration. After the upgrade, `adminReconcileFeesReserved` sets the fees
+    reserved for financings made before it.
 - Confirm each contract's initializer cannot be re-invoked and that
   `_disableInitializers()` is set in constructors.
 
@@ -255,19 +263,19 @@ via_ir = true
 nexa_contracts_audit/
 ├── README.md
 └── src/
-    ├── SubPool.sol                 # audit target (1703 LOC)
+    ├── SubPool.sol                 # audit target (1787 LOC)
     ├── WLP.sol                     # audit target (223 LOC)
     ├── WTKN.sol                    # audit target (372 LOC)
-    ├── ROR_ERC1155_V2.sol          # audit target (675 LOC)
-    ├── ROR_ERC1155_Storage.sol     # dependency (165 LOC)
+    ├── ROR_ERC1155_V2.sol          # audit target (727 LOC)
+    ├── ROR_ERC1155_Storage.sol     # dependency (176 LOC)
     ├── interfaces/
-    │   ├── IROR_ERC1155.sol        # dependency (248 LOC)
-    │   └── ISubPool.sol            # SubPool interface, generated from its ABI (340 LOC)
+    │   ├── IROR_ERC1155.sol        # dependency (249 LOC)
+    │   └── ISubPool.sol            # SubPool interface, generated from its ABI (349 LOC)
     └── libraries/
         └── RORPermissions.sol      # dependency (24 LOC)
 ```
 
-Total in-scope: **~3,400 LOC** across 7 files (4 targets + 3 dependencies), plus `ISubPool.sol`.
+Total in-scope: **~3,560 LOC** across 7 files (4 targets + 3 dependencies), plus `ISubPool.sol`.
 
 ---
 
@@ -288,3 +296,12 @@ Total in-scope: **~3,400 LOC** across 7 files (4 targets + 3 dependencies), plus
 6. **Access control & upgrade authorization** across all four contracts.
 7. **WTKN transfer restrictions & blacklist** — can they wedge settlement or trap funds?
 8. **Investor allowlist** — the on-chain gate vs. the off-chain (operator) trust model.
+9. **CertiK AI-scan fixes** — the ROR release now divides by the supply fixed on its
+   first call and rounds each share against a running total of settled units, so the
+   payouts add up to exactly the stake. A burning holder keeps its `_holders` slot
+   until the token settles, and nothing pays out once a stake is finalized. SubPool's
+   `recordDefault` marks the NAV stale until the next `updateNav` (allocate, redeem and
+   the NAV_m fix revert meanwhile), with an optional `maxNavAge`. `totalFeesReserved`
+   keeps uncollected fees out of financing liquidity, and `receiveInterest` /
+   `receiveSettlement` revert unless the credited WLP is held. Please check these
+   cannot block a normal settlement or redemption.

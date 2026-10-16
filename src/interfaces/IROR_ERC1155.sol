@@ -188,6 +188,7 @@ interface IROR_ERC1155 {
     error AlreadySettledFees();
     error InvoiceAmountTooSmall();
     error InvoiceAmountNotWholeSen();
+    error WTKNBuyerMismatch();
 
     // ============ Core Functions ============
 

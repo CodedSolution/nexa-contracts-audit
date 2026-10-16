@@ -51,6 +51,7 @@ interface ISubPool {
     error LockUpNotExpired(uint256 lockUpEndsAt);
     error NavNotSet();
     error NavPrecision(uint256 nav);
+    error NavStale();
     error NotSeriesAllocation();
     error NotWhitelisted(address investor);
     error PoolSizeExceeded(uint256 newSize, uint256 maxSize);
@@ -69,6 +70,7 @@ interface ISubPool {
     error SeriesNotMatured(uint256 seriesId, uint256 maturity);
     error SeriesNotStarted(uint256 seriesId, uint256 startDate);
     error SeriesTermsFrozen(uint256 seriesId);
+    error UnbackedCredit(uint256 held, uint256 required);
     error UseRedeemSeries();
     error UtilisationExceeded(uint256 currentUtilisation, uint256 maxUtilisation);
 
@@ -85,12 +87,14 @@ interface ISubPool {
     event DefaultRecorded(address indexed rorContract, uint256 indexed tokenId, uint256 lossAmount);
     event EarlyExitPenaltyUpdated(uint256 oldBps, uint256 newBps);
     event FeeWalletUpdated(address oldWallet, address newWallet);
+    event FeesReservedReconciled(uint256 oldValue, uint256 newValue);
     event FinancingReindexed(
         address indexed rorContract, uint256 indexed tokenId, uint256 financingId, uint256 faceValue
     );
     event Initialized(uint8 version);
     event InterestReceived(uint256 wlpAmount);
     event LockUpDurationUpdated(uint256 oldDuration, uint256 newDuration);
+    event MaxNavAgeUpdated(uint256 oldAge, uint256 newAge);
     event MaxPoolSizeUpdated(uint256 oldSize, uint256 newSize);
     event MaxUtilisationUpdated(uint256 oldBps, uint256 newBps);
     event Migrated(uint64 version);
@@ -169,6 +173,7 @@ interface ISubPool {
 
     function SERIES_ALLOCATION_WINDOW() external view returns (uint256);
     function UNIT_DECIMALS() external view returns (uint8);
+    function adminReconcileFeesReserved(uint256 correctValue) external;
     function adminReconcileOutstanding(uint256 correctValue) external;
     function adminReindexFinancing(
         address rorContract,
@@ -249,6 +254,7 @@ interface ISubPool {
     function isWhitelisted(address) external view returns (bool);
     function lockUpDuration() external view returns (uint256);
     function lockedUnits(address investor) external view returns (uint256 total);
+    function maxNavAge() external view returns (uint256);
     function maxPoolSize() external view returns (uint256);
     function maxUtilisationBps() external view returns (uint256);
     function migrateV2() external;
@@ -256,6 +262,7 @@ interface ISubPool {
     function migrateV4() external;
     function migrateV5() external;
     function minimumAllocation() external view returns (uint256);
+    function navStale() external view returns (bool);
     function navTimestamp() external view returns (uint256);
     function nextFinancingId(bytes32) external view returns (uint256);
     function onERC1155BatchReceived(address, address, uint256[] memory, uint256[] memory, bytes memory)
@@ -305,6 +312,7 @@ interface ISubPool {
     function setEarlyExitPenaltyBps(uint256 newBps) external;
     function setFeeWallet(address newWallet) external;
     function setLockUpDuration(uint256 newDuration) external;
+    function setMaxNavAge(uint256 newAge) external;
     function setMaxPoolSize(uint256 newSize) external;
     function setMaxUtilisationBps(uint256 newBps) external;
     function setMinimumAllocation(uint256 newMinimum) external;
@@ -316,6 +324,7 @@ interface ISubPool {
     function setWhitelistBatch(address[] memory investors, bool status) external;
     function setWhitelistEnabled(bool enabled) external;
     function supportsInterface(bytes4 interfaceId) external view returns (bool);
+    function totalFeesReserved() external view returns (uint256);
     function totalFinancedOutstanding() external view returns (uint256);
     function totalPlatformFeesCollected() external view returns (uint256);
     function totalPoolValue() external view returns (uint256);

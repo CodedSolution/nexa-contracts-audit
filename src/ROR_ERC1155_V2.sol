@@ -53,6 +53,9 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
     function registerWTKNContract(address buyer, address wtknContract) external onlyRole(ADMIN_ROLE) {
         if (buyer == address(0) || wtknContract == address(0)) revert IROR_ERC1155.InvalidAddress();
         if (buyerToWTKN[buyer] != address(0)) revert IROR_ERC1155.WTKNAlreadyReg();
+        // mintROR pulls the collateral from `buyer`, but a write-off refunds it to
+        // the WTKN's anchorBuyer(): they must be the same address.
+        if (IWTKN(wtknContract).anchorBuyer() != buyer) revert IROR_ERC1155.WTKNBuyerMismatch();
 
         buyerToWTKN[buyer] = wtknContract;
         emit IROR_ERC1155.WTKNContractRegistered(buyer, wtknContract);
@@ -106,8 +109,13 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         // through MINTER_ROLE, so the control that matters is custody of that
         // role's key, not the shape of this transfer. Reviewed and accepted;
         // see the security assessment's accepted-risk register.
+        uint256 heldBefore = wtknToken.balanceOf(address(this));
         // slither-disable-next-line arbitrary-send-erc20
         if (!wtknToken.transferFrom(anchorBuyer, address(this), invoiceAmount)) {
+            revert IROR_ERC1155.WTKNTransferFailed();
+        }
+        // Mint only against collateral that actually arrived.
+        if (wtknToken.balanceOf(address(this)) < heldBefore + invoiceAmount) {
             revert IROR_ERC1155.WTKNTransferFailed();
         }
         wtknToken.recordStake(tokenId, invoiceAmount);
@@ -165,10 +173,8 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
 
         uint8 recipientTier = senderState.tier + 1;
 
-        // Transfer ROR tokens
-        _safeTransferFrom(msg.sender, to, tokenId, amount, "");
-
-        // Set or validate recipient tier.
+        // Set or validate recipient tier — before the transfer, whose receiver
+        // hook calls into `to`, so a contract recipient already holds its tier.
         // If recipient is new to this token, assign the expected tier.
         // If they already have a tier, it must exactly match sender.tier + 1 —
         // this blocks both backwards transfers and cross-tier shortcuts.
@@ -179,6 +185,9 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         } else if (recipientState.tier != recipientTier) {
             revert IROR_ERC1155.TierMismatch(tokenId, to, recipientState.tier, recipientTier);
         }
+
+        // Transfer ROR tokens
+        _safeTransferFrom(msg.sender, to, tokenId, amount, "");
 
         // Events carry all transfer metadata
         emit IROR_ERC1155.RORTransferredAsPayment(tokenId, msg.sender, to, amount, downstreamInvoiceId, recipientTier);
@@ -265,6 +274,9 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         WTKNStake storage stake = wtknStakes[tokenId];
         if (stake.amount == 0) revert IROR_ERC1155.WTKNNotStaked();
         if (block.timestamp < stake.expiryDate) revert IROR_ERC1155.ExpiryDateNotReached();
+        // Nothing is owed on a finalized stake: paying now would draw on another
+        // receivable's WTKN. A no-op rather than a revert, so a re-run is harmless.
+        if (stake.isReleased) return (0, 0);
 
         // Update status to MATURED on first release
         if (!stake.maturityReached) {
@@ -283,10 +295,17 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         // which lets a bloated holder set (dust fan-out) push this call over the
         // block gas limit and permanently freeze WTKN release. Indexing storage
         // directly inside the batch window keeps the cost O(batchSize). Safe because
-        // ROR transfers are blocked post-maturity, so _holders cannot change here.
+        // after maturity transfers are blocked and burns keep the holder's slot
+        // until settlement (see _afterTokenTransfer), so _holders cannot reorder.
         uint256 holderCount = _holders[tokenId].length;
-        uint256 supply = totalSupply(tokenId);
-        if (supply == 0) revert IROR_ERC1155.InvalidAmount();
+        // Shares are taken of the supply fixed on the first release, so the
+        // payouts can never add up to more than the stake.
+        uint256 supply = _settlementSupply[tokenId];
+        if (supply == 0) {
+            supply = totalSupply(tokenId);
+            if (supply == 0) revert IROR_ERC1155.InvalidAmount();
+            _settlementSupply[tokenId] = supply;
+        }
 
         uint256 endIndex = batchSize == 0 ? holderCount : startIndex + batchSize;
         if (endIndex > holderCount) endIndex = holderCount;
@@ -295,14 +314,22 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         IWTKN wtknToken = IWTKN(stake.wtknContract);
         successCount = 0;
         totalAmount = 0;
+        uint256 settledUnits = _settledUnits[tokenId];
 
         for (uint256 i = startIndex; i < endIndex; i++) {
             address holder = _holders[tokenId][i];
             uint256 rorBalance = balanceOf(holder, tokenId);
 
-            if (rorBalance == 0 || stake.releasedAmounts[holder] > 0) continue;
+            // _hasClaimed alone marks a holder whose share rounded to zero.
+            if (rorBalance == 0 || stake.releasedAmounts[holder] > 0 || _hasClaimed[tokenId][holder]) continue;
 
-            uint256 wtknAmount = (stake.amount * rorBalance) / supply;
+            // The share of the units settled so far, after this holder, less the
+            // share before it: the floors telescope, so once every unit is settled
+            // the shares add up to exactly the stake — no dust left to block
+            // finalization. Each holder is within 1 wei of its exact pro-rata.
+            uint256 wtknAmount = (stake.amount * (settledUnits + rorBalance)) / supply
+                - (stake.amount * settledUnits) / supply;
+            settledUnits += rorBalance;
 
             if (wtknAmount == 0) {
                 _hasClaimed[tokenId][holder] = true;
@@ -329,6 +356,8 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
                 emit IROR_ERC1155.WTKNReleaseRetryNeeded(tokenId, holder, wtknAmount);
             }
         }
+
+        _settledUnits[tokenId] = settledUnits;
 
         if (stake.totalReleased >= stake.amount && !stake.isReleased) {
             _finalizeStakeRelease(tokenId, stake);
@@ -403,12 +432,17 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         address holder,
         address newRecipient
     ) external onlyRole(ADMIN_ROLE) nonReentrant {
-        if (newRecipient == address(0)) revert IROR_ERC1155.InvalidAddress();
+        // Not this contract: a self-transfer moves nothing, yet the claim would
+        // be cleared and the stake finalized with the WTKN stranded here.
+        if (newRecipient == address(0) || newRecipient == address(this)) revert IROR_ERC1155.InvalidAddress();
 
         uint256 pending = _pendingWTKNRelease[tokenId][holder];
         if (pending == 0) revert IROR_ERC1155.NoPendingRelease(tokenId, holder);
 
         WTKNStake storage stake = wtknStakes[tokenId];
+        // As in retryWTKNRelease: a parked claim on a finalized stake is no
+        // longer backed by this receivable's collateral.
+        if (stake.isReleased) revert IROR_ERC1155.WTKNAlreadyReleased();
 
         // Effects before interaction. If the transfer below reverts, all of
         // these state changes roll back with it.
@@ -425,9 +459,7 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         emit IROR_ERC1155.WTKNReleased(tokenId, newRecipient, pending);
 
         // Finalize settlement if this was the last outstanding release.
-        if (stake.totalReleased >= stake.amount && !stake.isReleased) {
-            _finalizeStakeRelease(tokenId, stake);
-        }
+        if (stake.totalReleased >= stake.amount) _finalizeStakeRelease(tokenId, stake);
     }
 
     // ============ Burn Functions ============
@@ -543,13 +575,22 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         external view returns (address[] memory holders, uint256[] memory balances)
     {
         if (tokenId < MIN_TOKEN_ID || tokenId >= _tokenIdCounter) revert IROR_ERC1155.InvalidTokenId();
+        // A holder who burns while the token settles keeps its slot with a zero
+        // balance (see _afterTokenTransfer); list only live holders.
         address[] memory allHolders = _holders[tokenId];
-        uint256 count = allHolders.length;
+        uint256 count;
+        for (uint256 i = 0; i < allHolders.length; i++) {
+            if (balanceOf(allHolders[i], tokenId) > 0) count++;
+        }
         holders = new address[](count);
         balances = new uint256[](count);
-        for (uint256 i = 0; i < count; i++) {
-            holders[i] = allHolders[i];
-            balances[i] = balanceOf(allHolders[i], tokenId);
+        uint256 j;
+        for (uint256 i = 0; i < allHolders.length; i++) {
+            uint256 bal = balanceOf(allHolders[i], tokenId);
+            if (bal == 0) continue;
+            holders[j] = allHolders[i];
+            balances[j] = bal;
+            j++;
         }
     }
 
@@ -591,6 +632,14 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
     function _finalizeStakeRelease(uint256 tokenId, WTKNStake storage stake) internal {
         stake.isReleased = true;
         IWTKN(stake.wtknContract).recordUnstake(tokenId, stake.amount);
+    }
+
+    /// @dev Due (or already releasing) and not yet finalized: the holder set is
+    ///      frozen for releaseWTKNToAllHoldersPaginated.
+    function _isSettling(uint256 tokenId) internal view returns (bool) {
+        WTKNStake storage stake = wtknStakes[tokenId];
+        if (stake.isReleased) return false;
+        return (stake.expiryDate > 0 && block.timestamp >= stake.expiryDate) || stake.maturityReached;
     }
 
     // ============ Hooks and Overrides ============
@@ -646,8 +695,11 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
             if (to != address(0) && balanceOf(to, ids[i]) > 0) {
                 _addHolder(ids[i], to);
             }
-            // Remove sender only if their balance is now fully depleted.
-            if (from != address(0) && balanceOf(from, ids[i]) == 0) {
+            // Remove sender only if their balance is now fully depleted, and not
+            // while the token is settling: a paid holder's burn would swap the
+            // last holder into its slot, behind a forward release cursor, and
+            // leave them unpaid. The empty slot is skipped by the release loop.
+            if (from != address(0) && balanceOf(from, ids[i]) == 0 && !_isSettling(ids[i])) {
                 _removeHolder(ids[i], from);
             }
         }

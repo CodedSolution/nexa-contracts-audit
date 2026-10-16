@@ -172,10 +172,30 @@ contract SubPool is
     // min(MRP, NAV_m), however long payment takes.
     mapping(uint256 => uint256) public seriesMaturityNav;
 
+    // ─── NAV freshness ───
+    // Appended after all prior state (consuming two slots from __gap); both
+    // read 0 after the upgrade, so no backfill is needed.
+    //
+    // Set by recordDefault, cleared by the next updateNav. A default can cut the
+    // backing per unit far below the stored NAV, so until a new NAV is pushed no
+    // one may allocate or redeem at it (and NAV_m can't be fixed from it).
+    bool public navStale;
+    // The longest a pushed NAV may be used for allocations and redemptions, in
+    // seconds. 0 = no limit.
+    uint256 public maxNavAge;
+
+    // ─── Fee reserve ───
+    // WLP held for financing fees not yet collected (platform + legacy reserve).
+    // It sits in the contract outside totalWlpBalance, so it must never fund a
+    // financing nor count as backing. Appended after all prior state (one slot
+    // from __gap). Reads 0 after the upgrade: fees of earlier financings are
+    // added with adminReconcileFeesReserved.
+    uint256 public totalFeesReserved;
+
     // ─── Storage Gap ───
-    // Reduced from 45 → 42 for the 3 slots consumed above, keeping the total
+    // Reduced from 42 → 39 for the 3 slots consumed above, keeping the total
     // reserved storage footprint constant across this upgrade.
-    uint256[42] private __gap;
+    uint256[39] private __gap;
 
     // ─── Precision (constants: no storage) ───
     // LP token amounts and units move in whole cents (2 dp). NAV per unit and
@@ -242,6 +262,7 @@ contract SubPool is
     event EarlyExitPenaltyUpdated(uint256 oldBps, uint256 newBps);
     event FeeWalletUpdated(address oldWallet, address newWallet);
     event MinimumAllocationUpdated(uint256 oldAmount, uint256 newAmount);
+    event MaxNavAgeUpdated(uint256 oldAge, uint256 newAge);
     event WTKNReturnedToBuyer(address indexed buyer, uint256 amount);
     event RORBurned(address indexed rorContract, uint256 indexed tokenId, uint256 amount);
     event SeriesCreated(uint256 indexed seriesId, string name, uint256 lockUpSeconds, uint256 startDate, uint256 endDate, uint256 maxSize);
@@ -252,6 +273,7 @@ contract SubPool is
     // Recovery / migration
     event FinancingReindexed(address indexed rorContract, uint256 indexed tokenId, uint256 financingId, uint256 faceValue);
     event OutstandingReconciled(uint256 oldValue, uint256 newValue);
+    event FeesReservedReconciled(uint256 oldValue, uint256 newValue);
     event Migrated(uint64 version);
     // Series redemption at min(MRP, NAV)
     event SeriesNirSet(uint256 indexed seriesId, uint256 nirBps);
@@ -313,6 +335,8 @@ contract SubPool is
     error LegacyTermsRequired(uint256 seriesId);
     error EntryNavAlreadySet(uint256 seriesId);
     error SeriesAllocationClosed(uint256 seriesId, uint256 closesAt);
+    error NavStale();
+    error UnbackedCredit(uint256 held, uint256 required);
 
     // ═══════════════════════════════════════════════════════════════
     //                        CONSTRUCTOR
@@ -429,14 +453,16 @@ contract SubPool is
         if (wlpAmount == 0) revert InvalidAmount();
         if (wlpAmount % CENT != 0) revert AmountPrecision(wlpAmount);
         if (currentNav == 0) revert NavNotSet();
+        // Also for a Series: its units are issued at NAV₀, which a default
+        // since then may have left well above the backing per unit.
+        _requireFreshNav();
         if (investmentType > 1) revert InvalidAmount();
 
-        uint256 lockUpSeconds;
-        // For a Series, the lock-up ends on the series' fixed maturity (endDate)
-        // so every subscriber matures on the SAME calendar date regardless of
-        // when they allocated within the window. 0 = unset (Participatory, or a
-        // Series created with no endDate → fall back to the rolling lock-up).
-        uint256 seriesEndDate = 0;
+        // Participatory: a rolling lock-up from the allocation time. Series: the
+        // series' fixed maturity (endDate), so every subscriber matures on the
+        // SAME calendar date — the backend's startDate-anchored maturityDate —
+        // regardless of when they allocated within the window.
+        uint256 lockUpEndsAt;
         // NAV the units are issued at: the live NAV for Participatory, the
         // Series' own fixed NAV₀ for a Series.
         uint256 issueNav = currentNav;
@@ -444,7 +470,7 @@ contract SubPool is
         if (investmentType == 0) {
             // Participatory — use pool-level lock-up and minimum
             if (wlpAmount < minimumAllocation) revert BelowMinimumAllocation(wlpAmount, minimumAllocation);
-            lockUpSeconds = lockUpDuration;
+            lockUpEndsAt = block.timestamp + lockUpDuration;
             seriesId = 0;
         } else {
             // Series — validate series registry and enforce its rules
@@ -479,8 +505,8 @@ contract SubPool is
             } else {
                 s.totalAllocated += wlpAmount;
             }
-            lockUpSeconds = s.lockUpSeconds;
-            seriesEndDate = s.endDate;
+            // Never back-dated: the SeriesEnded check above keeps now < endDate.
+            lockUpEndsAt = s.endDate;
             // Every investor in the Series shares one NAV₀ and one MRP.
             issueNav = seriesEntryNav[seriesId];
         }
@@ -503,16 +529,7 @@ contract SubPool is
         // Update pool accounting
         totalWlpBalance += wlpAmount;
 
-        // Record allocation. Series allocations mature on the series' fixed
-        // endDate (series-wide maturity) so on-chain expiry matches the backend's
-        // startDate-anchored maturityDate; Participatory uses a rolling lock-up
-        // from the allocation time. A Series with endDate == 0 falls back to the
-        // rolling lock-up so an expiry is always enforced. endDate >= block.timestamp
-        // is guaranteed here by the SeriesEnded check above, so lockUpEndsAt is
-        // never back-dated for a fresh allocation.
-        uint256 lockUpEndsAt = seriesEndDate > 0
-            ? seriesEndDate
-            : block.timestamp + lockUpSeconds;
+        // Record allocation
         _allocations[msg.sender].push(Allocation({
             wlpAmount: wlpAmount,
             unitsIssued: unitsToIssue,
@@ -581,6 +598,7 @@ contract SubPool is
         uint256 prev = currentNav;
         currentNav = newNav;
         navTimestamp = block.timestamp;
+        navStale = false;
 
         // Emit alert for swings > 20% so monitoring can flag mis-keys.
         if (prev > 0) {
@@ -653,9 +671,11 @@ contract SubPool is
 
         // Verify tracked balance matches actual contract balance to detect drift.
         // Use the lesser of the two as the available liquidity so we never
-        // over-commit capital that the contract doesn't actually hold.
+        // over-commit capital that the contract doesn't actually hold. The WLP
+        // held for uncollected fees is not capital: leave it out of the balance.
         uint256 actualBalance = wlpToken.balanceOf(address(this));
-        uint256 available = totalWlpBalance < actualBalance ? totalWlpBalance : actualBalance;
+        uint256 freeBalance = actualBalance > totalFeesReserved ? actualBalance - totalFeesReserved : 0;
+        uint256 available = totalWlpBalance < freeBalance ? totalWlpBalance : freeBalance;
         if (available < totalCommit) revert InsufficientLiquidity(available, totalCommit);
 
         // CEI: update all state before the external transfer call.
@@ -664,6 +684,7 @@ contract SubPool is
         // as investor principal by fee collection.
         totalWlpBalance -= totalCommit;
         totalFinancedOutstanding += faceValue;
+        totalFeesReserved += platformFee + reserveFee;
         financings[key] = FinancingRecord({
             rorContract: rorContract,
             rorTokenId: tokenId,
@@ -720,6 +741,7 @@ contract SubPool is
         // increase balance by the received amount (amount is trusted, as before).
         totalFinancedOutstanding -= totalFace;
         totalWlpBalance += wlpAmount;
+        _requireBacked();
 
         emit SettlementReceived(rorContract, tokenId, wlpAmount);
     }
@@ -735,6 +757,7 @@ contract SubPool is
         if (wlpAmount % CENT != 0) revert AmountPrecision(wlpAmount);
 
         totalWlpBalance += wlpAmount;
+        _requireBacked();
 
         emit InterestReceived(wlpAmount);
     }
@@ -775,6 +798,11 @@ contract SubPool is
         // loss flows through NAV on the next update.
         totalFinancedOutstanding -= totalFace;
 
+        // Until that update the stored NAV overstates the backing per unit: a
+        // redemption at it would push this loss onto the holders who stay.
+        // Not pause-gated, so this also holds across pause → default → unpause.
+        navStale = true;
+
         emit DefaultRecorded(rorContract, tokenId, lossAmount);
     }
 
@@ -800,6 +828,7 @@ contract SubPool is
         uint256 amount = f.platformFeeOwed;
         f.platformFeeCollected = true;
         totalPlatformFeesCollected += amount;
+        _releaseFeeReserve(amount);
 
         if (amount > 0) {
             wlpToken.safeTransfer(feeWallet, amount);
@@ -829,6 +858,7 @@ contract SubPool is
         uint256 amount = f.reserveFeeOwed;
         f.reserveFeeCollected = true;
         totalReserveFundCollected += amount;
+        _releaseFeeReserve(amount);
 
         if (amount > 0) {
             wlpToken.safeTransfer(reserveFundWallet, amount);
@@ -860,6 +890,7 @@ contract SubPool is
 
         uint256 amount = f.reserveFeeOwed;
         f.reserveFeeCollected = true;
+        _releaseFeeReserve(amount);
         totalWlpBalance += amount;
 
         emit ReserveFeeReleasedToPool(rorContract, tokenId, financingId, amount);
@@ -989,6 +1020,18 @@ contract SubPool is
     }
 
     /**
+     * @notice Set the longest a pushed NAV may be used for allocations and
+     *         redemptions. Set it above the push interval (e.g. 2 days for a
+     *         daily push), so one late push doesn't halt the pool.
+     * @param newAge Seconds; 0 = no limit
+     */
+    function setMaxNavAge(uint256 newAge) external onlyOwner {
+        uint256 oldAge = maxNavAge;
+        maxNavAge = newAge;
+        emit MaxNavAgeUpdated(oldAge, newAge);
+    }
+
+    /**
      * @notice Add or remove a single investor from the allocation allowlist
      * @param investor Investor address to update
      * @param status True to whitelist, false to remove
@@ -1027,7 +1070,8 @@ contract SubPool is
      * @param name Human-readable label e.g. "Series A"
      * @param lockUpSeconds Lock-up duration for investors in this series
      * @param startDate Unix timestamp when allocation window opens
-     * @param endDate Unix timestamp when allocation window closes (0 = no end)
+     * @param endDate Series maturity (unix timestamp), after startDate. Required:
+     *        it fixes the MRP tenor and every subscriber's lock-up.
      * @param maxSize Maximum WLP this series accepts (0 = unlimited)
      * @param minAllocation Minimum WLP per investor (0 = no minimum)
      * @return seriesId The ID assigned to the new series
@@ -1042,7 +1086,7 @@ contract SubPool is
     ) external onlyOwner returns (uint256 seriesId) {
         if (lockUpSeconds == 0) revert InvalidSeriesConfig();
         if (bytes(name).length == 0) revert InvalidSeriesConfig();
-        if (endDate > 0 && endDate <= startDate) revert InvalidSeriesConfig();
+        if (endDate <= startDate) revert InvalidSeriesConfig();
 
         seriesId = ++seriesCount;
 
@@ -1065,7 +1109,7 @@ contract SubPool is
      * @dev lockUpSeconds cannot be changed after creation to protect existing allocations
      * @param seriesId Series to update
      * @param startDate New start date (0 = keep existing)
-     * @param endDate New end date (0 = no end)
+     * @param endDate New maturity date, after the start date
      * @param maxSize New max size (0 = unlimited)
      * @param minAllocation New minimum per investor (0 = no minimum)
      */
@@ -1087,7 +1131,7 @@ contract SubPool is
         // epoch, which allocate() would treat as immediately open and could reopen
         // a future-dated series before its intended launch.
         uint256 newStartDate = startDate == 0 ? s.startDate : startDate;
-        if (endDate > 0 && endDate <= newStartDate) revert InvalidSeriesConfig();
+        if (endDate <= newStartDate) revert InvalidSeriesConfig();
 
         s.startDate = newStartDate;
         s.endDate = endDate;
@@ -1171,6 +1215,8 @@ contract SubPool is
         if (seriesMaturityNav[seriesId] != 0) revert SeriesMaturityNavAlreadyFixed(seriesId);
         if (block.timestamp < s.endDate) revert SeriesNotMatured(seriesId, s.endDate);
         if (navTimestamp < s.endDate) revert SeriesNavStale(navTimestamp, s.endDate);
+        // A default since that push: NAV_m must reflect it.
+        if (navStale) revert NavStale();
 
         seriesMaturityNav[seriesId] = currentNav;
         emit SeriesMaturityNavFixed(seriesId, currentNav);
@@ -1399,6 +1445,8 @@ contract SubPool is
         if (addToOutstanding) {
             totalFinancedOutstanding += faceValue;
         }
+        // Its fees' WLP is held but uncollected: keep it out of capital.
+        totalFeesReserved += platformFeeOwed + reserveFeeOwed;
 
         emit FinancingReindexed(rorContract, tokenId, financingId, faceValue);
     }
@@ -1415,6 +1463,18 @@ contract SubPool is
         uint256 oldValue = totalFinancedOutstanding;
         totalFinancedOutstanding = correctValue;
         emit OutstandingReconciled(oldValue, correctValue);
+    }
+
+    /**
+     * @notice Set totalFeesReserved to a reconciled absolute value.
+     * @dev For fees of financings made before this upgrade. correctValue MUST be
+     *      computed off-chain as the sum of platformFeeOwed (and reserveFeeOwed)
+     *      over all financings whose fee is not yet collected.
+     */
+    function adminReconcileFeesReserved(uint256 correctValue) external onlyOwner {
+        uint256 oldValue = totalFeesReserved;
+        totalFeesReserved = correctValue;
+        emit FeesReservedReconciled(oldValue, correctValue);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1567,6 +1627,28 @@ contract SubPool is
         return x - (x % CENT);
     }
 
+    /// @dev The WLP held must cover the pool's capital plus the fees held for
+    ///      collection — so nothing is credited before it has arrived.
+    function _requireBacked() internal view {
+        uint256 held = wlpToken.balanceOf(address(this));
+        uint256 required = totalWlpBalance + totalFeesReserved;
+        if (held < required) revert UnbackedCredit(held, required);
+    }
+
+    /// @dev A fee leaving the reserve (collected or released to the pool). A fee
+    ///      of a financing made before the reserve existed may not be counted in
+    ///      it, so this floors at zero instead of underflowing.
+    function _releaseFeeReserve(uint256 amount) internal {
+        totalFeesReserved = totalFeesReserved > amount ? totalFeesReserved - amount : 0;
+    }
+
+    /// @dev No allocation or redemption at a NAV a default has made stale, or
+    ///      one older than maxNavAge (when set).
+    function _requireFreshNav() internal view {
+        if (navStale) revert NavStale();
+        if (maxNavAge != 0 && block.timestamp > navTimestamp + maxNavAge) revert NavStale();
+    }
+
     /// @dev A NAV per unit must be within the valid range and exactly 4 dp.
     function _checkNav(uint256 nav) internal pure {
         if (nav < MIN_NAV || nav > MAX_NAV) revert InvalidAmount();
@@ -1622,6 +1704,8 @@ contract SubPool is
         if (!early && block.timestamp < alloc.lockUpEndsAt) {
             revert LockUpNotExpired(alloc.lockUpEndsAt);
         }
+
+        _requireFreshNav();
 
         // Calculate WLP to return: wlpReturn = units * currentNav / 1e18
         uint256 wlpToReturn = (units * currentNav) / 1e18;

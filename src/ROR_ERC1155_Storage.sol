@@ -103,9 +103,20 @@ abstract contract ROR_ERC1155_Storage is
     // preserve the UUPS storage layout. Defaults false for pre-upgrade financings.
     mapping(uint256 => mapping(uint256 => bool)) public feesSettled;
 
+    // ROR supply fixed on the first WTKN release, the denominator for every
+    // holder's share. The live supply can't be used: a holder paid on an earlier
+    // page may burn, which would enlarge every later share past the stake.
+    // Appended in 2.1.0 (consuming one __gap slot); 0 = release not started.
+    mapping(uint256 => uint256) internal _settlementSupply;
+    // ROR units whose share the release has already assigned (paid, parked or
+    // zero). Each share is rounded against this running total, so the shares
+    // add up to exactly the stake. Appended in 2.1.0 (one __gap slot).
+    mapping(uint256 => uint256) internal _settledUnits;
+
     // ============ Storage Gap ============
-    // Reduced 42 -> 41 for the feesSettled mapping above; total reserved slots constant.
-    uint256[41] private __gap;
+    // Reduced 41 -> 39 for _settlementSupply and _settledUnits above; total
+    // reserved slots constant.
+    uint256[39] private __gap;
 
     // ============ Internal Helpers ============
 
