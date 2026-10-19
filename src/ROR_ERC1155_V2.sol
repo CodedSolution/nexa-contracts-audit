@@ -71,6 +71,22 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
         return _symbol;
     }
 
+    /**
+     * @notice Display decimals for ROR amounts: 2 (one unit = one sen) or 0
+     *         (one unit = RM1, a token minted before 2.1.0).
+     * @dev Not part of ERC-1155. Block explorers read it to show a transfer
+     *      value as value / 10^decimals; ERC-1155 has no standard place for
+     *      this, and metadata JSON decimals are not read for it. Display only:
+     *      no amount in this contract depends on it.
+     *      The platform deploys one ROR per contract (token MIN_TOKEN_ID), so
+     *      the contract-wide value follows that token's scale. A contract with
+     *      no token yet answers 2, since every mint from 2.1.0 counts sen.
+     */
+    function decimals() external view returns (uint8) {
+        bool legacyToken = wtknStakes[MIN_TOKEN_ID].amount != 0 && tokenState[MIN_TOKEN_ID].weiPerUnit == 0;
+        return legacyToken ? 0 : 2;
+    }
+
     // ============ Core Functions - ROR Minting ============
 
     function mintROR(
@@ -609,7 +625,7 @@ contract ROR_ERC1155_V2 is ROR_ERC1155_Storage {
     }
 
     function version() external pure returns (string memory) {
-        return "2.1.0";
+        return "2.2.0";
     }
 
     // ============ Internal Helpers ============
