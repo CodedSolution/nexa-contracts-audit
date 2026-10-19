@@ -246,4 +246,7 @@ interface IROR_ERC1155 {
     function weiPerUnit(uint256 tokenId) external view returns (uint256);
     function getPendingRelease(uint256 tokenId, address holder) external view returns (uint256);
     function version() external pure returns (string memory);
+
+    // Added in 2.2.0: display decimals (2 = sen, 0 = whole ringgit) for explorers.
+    function decimals() external view returns (uint8);
 }

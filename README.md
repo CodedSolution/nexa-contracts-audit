@@ -20,7 +20,7 @@ mediates buyer-side settlement flows.
 | **SubPool** | `src/SubPool.sol` | 1.9.0 | — | UUPS · Ownable · Pausable · ReentrancyGuard · ERC1155Holder | Per-buyer investor liquidity pool: allocate/redeem, NAV oracle, supplier financing, settlement, fees, **investor allowlist** |
 | **WLP** | `src/WLP.sol` | 1.1.0 | ERC-20 | UUPS · Ownable · Pausable | Working Liquidity Pool token; owner-minted, fiat-backed |
 | **WTKN** | `src/WTKN.sol` | 2.0.0 | ERC-20 | UUPS · Ownable · Pausable | Per-anchor-buyer wrapped token with blacklist + transfer restrictions |
-| **ROR (V2)** | `src/ROR_ERC1155_V2.sol` | 2.1.0 | ERC-1155 | UUPS · AccessControl | Multi-tier receivable/invoice tokens with maturity + settlement lifecycle |
+| **ROR (V2)** | `src/ROR_ERC1155_V2.sol` | 2.2.0 | ERC-1155 | UUPS · AccessControl | Multi-tier receivable/invoice tokens with maturity + settlement lifecycle |
 
 ### In scope — supporting files (dependencies of the above; not standalone)
 
@@ -143,7 +143,12 @@ one ROR unit is one **sen** (RM0.01, `1e16` wei of WTKN): an invoice of RM35,000
 stakes 35,000.45 WTKN and mints 3,500,045 units. `mintROR` rejects an amount that is
 not a whole number of sen (`InvoiceAmountNotWholeSen`) or below one sen
 (`InvoiceAmountTooSmall`). Tokens minted by an earlier implementation keep one unit
-= RM1 (`1e18` wei); `weiPerUnit(tokenId)` returns each token's scale. Models a
+= RM1 (`1e18` wei); `weiPerUnit(tokenId)` returns each token's scale. From
+**2.2.0**, `decimals()` returns 2 (sen) or 0 (a legacy whole-ringgit token) so
+block explorers show amounts in ringgit; it is not part of ERC-1155, is display
+only, and no amount in the contract depends on it. The platform deploys one ROR
+per contract (token id 1000), so the contract-wide value follows that token's
+scale. Models a
 **deep supply chain**: the originating supplier holds **tier 1**, and each onward
 transfer down the chain assigns **tier + 1** (forward-only — backwards and
 cross-tier-skip transfers are rejected). Transfers are blocked at/after maturity. On
@@ -266,16 +271,16 @@ nexa_contracts_audit/
     ├── SubPool.sol                 # audit target (1787 LOC)
     ├── WLP.sol                     # audit target (223 LOC)
     ├── WTKN.sol                    # audit target (372 LOC)
-    ├── ROR_ERC1155_V2.sol          # audit target (727 LOC)
+    ├── ROR_ERC1155_V2.sol          # audit target (743 LOC)
     ├── ROR_ERC1155_Storage.sol     # dependency (176 LOC)
     ├── interfaces/
-    │   ├── IROR_ERC1155.sol        # dependency (249 LOC)
+    │   ├── IROR_ERC1155.sol        # dependency (252 LOC)
     │   └── ISubPool.sol            # SubPool interface, generated from its ABI (349 LOC)
     └── libraries/
         └── RORPermissions.sol      # dependency (24 LOC)
 ```
 
-Total in-scope: **~3,560 LOC** across 7 files (4 targets + 3 dependencies), plus `ISubPool.sol`.
+Total in-scope: **~3,580 LOC** across 7 files (4 targets + 3 dependencies), plus `ISubPool.sol`.
 
 ---
 
@@ -285,7 +290,8 @@ Total in-scope: **~3,560 LOC** across 7 files (4 targets + 3 dependencies), plus
 2. **ROR sen units (2.1.0)** — whole-sen mint checks, the per-token scale
    (`weiPerUnit`, legacy `0` → `1e18`), the at-financing fee cap at both scales,
    rounding of the pro-rata WTKN release with sen units (including after a burn
-   before maturity), and the single `recordUnstake` per stake.
+   before maturity), and the single `recordUnstake` per stake. 2.2.0 adds the
+   view-only `decimals()` (no storage change).
 3. **Series redemption at min(MRP, NAV_m)** — MRP math and rounding, the one-time
    NAV_m fix (stale-NAV guard), instalment (`redeemSeries` partial) accounting,
    the legacy back-fill, and that no path pays a Series more than min(MRP, NAV_m).
